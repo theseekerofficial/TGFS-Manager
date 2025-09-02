@@ -1819,7 +1819,7 @@ class TGFSBot:
         if display_message:
             # Update the import session message to show collected files
             files_list = "\n".join([f"• {file['file_info']['name']} ({self.format_file_size(file['file_info']['size'])})"
-                                    for file in import_session['files_to_import']])
+                 for file in import_session['files_to_import']])
 
             try:
                 await client.edit_message_text(
@@ -1830,12 +1830,18 @@ class TGFSBot:
                         f"🛣️ **Target Path:** `{unquote(import_session['current_path'])}`\n\n"
                         f"**Files Collected ({len(import_session['files_to_import'])}):**\n"
                         f"{files_list}\n\n"
-                        "**Send more files or click Done to import:**"
+                        "**Send more files or click an option below:**\n\n"
+                        "**⚠️ DO NOT DELETE THE FILES YOU SENT OR FORWARDED**"
+
                     ),
                     reply_markup=InlineKeyboardMarkup([
                         [
                             InlineKeyboardButton("✅ Done - Import Files",
                                                  callback_data=f"import_done:{import_session_id}"),
+                            InlineKeyboardButton("📂 Import with Folders",
+                                                 callback_data=f"import_with_folders:{import_session_id}")
+                        ],
+                        [
                             InlineKeyboardButton("❌ Cancel",
                                                  callback_data=f"import_cancel:{import_session_id}")
                         ]
@@ -1849,7 +1855,7 @@ class TGFSBot:
         data = callback_query.data
         user_id = callback_query.from_user.id
 
-        if data.startswith('import_done:') or data.startswith('import_cancel:'):
+        if data.startswith('import_done:') or data.startswith('import_cancel:') or data.startswith('import_with_folders:'):
             await self.handle_import_callback(client, callback_query, data)
             return
 
@@ -1989,12 +1995,16 @@ class TGFSBot:
                     f"📥 **Import Files Mode**\n"
                     f"🛣️ **Target Path:** `{unquote(import_session['current_path'])}`\n\n"
                     "**Send or forward files you want to import to this folder.**\n"
-                    "Files will be imported when you click 'Done'.\n\n"
+                    "Files will be imported when you click an option below.\n\n"
                     "**Send files now...**",
                     reply_markup=InlineKeyboardMarkup([
                         [
                             InlineKeyboardButton("✅ Done - Import Files",
                                                  callback_data=f"import_done:{import_session_id}"),
+                            InlineKeyboardButton("📂 Import with Folders",
+                                                 callback_data=f"import_with_folders:{import_session_id}")
+                        ],
+                        [
                             InlineKeyboardButton("❌ Cancel",
                                                  callback_data=f"import_cancel:{import_session_id}")
                         ]
@@ -2649,11 +2659,41 @@ class TGFSBot:
             await callback_query.answer("Unknown action", show_alert=True)
 
     async def handle_import_callback(self, client, callback_query: CallbackQuery, data: str):
-        """Handle import-specific callbacks (import_done, import_cancel)"""
+        """Handle import-specific callbacks (import_done, import_cancel, import_with_folders)"""
+        def truncate_path(path: str, max_length: int = 140) -> str:
+            if len(path) <= max_length:
+                return path
+
+            display_path = path
+            if display_path.startswith('/webdav'):
+                display_path = display_path[len('/webdav'):]
+
+            if len(display_path) <= max_length:
+                return display_path
+
+            available_length = max_length - 3
+            start_chars = int(available_length * 0.6)
+            end_chars = available_length - start_chars
+
+            start_part = display_path[:start_chars]
+            end_part = display_path[-end_chars:] if end_chars > 0 else ""
+
+            last_sep_in_start = start_part.rfind('/')
+            if last_sep_in_start != -1 and last_sep_in_start > (start_chars - 20):
+                start_part = start_part[:last_sep_in_start + 1]
+
+            first_sep_in_end = end_part.find('/')
+            if first_sep_in_end != -1 and first_sep_in_end < (end_chars - 10):
+                end_part = end_part[first_sep_in_end:]
+
+            truncated_path = f"{start_part}...{end_part}"
+            return truncated_path
+
         user_id = callback_query.from_user.id
 
-        if data.startswith('import_done:'):
-            # Handle import completion
+        if data.startswith('import_done:') or data.startswith('import_with_folders:'):
+            # Handle import completion (both regular and with folders)
+            import_type = data.split(':', 1)[0]
             import_session_id = data.split(':', 1)[1]
 
             if import_session_id not in self.import_sessions:
@@ -2661,6 +2701,12 @@ class TGFSBot:
                 return
 
             import_session = self.import_sessions[import_session_id]
+
+            prepared_path = truncate_path(unquote(import_session['current_path']))
+            if import_type == 'import_done':
+                await callback_query.answer(f"Files will be imported directly to the parent '{prepared_path}' folder", show_alert=True)
+            elif import_type == 'import_with_folders':
+                await callback_query.answer(f"A new folder will be created for each file inside the parent '{prepared_path}' folder", show_alert=True)
 
             # Verify user ownership
             if import_session['user_id'] != user_id:
@@ -2674,7 +2720,7 @@ class TGFSBot:
                 return
 
             await callback_query.edit_message_text(
-                f"📤 **Importing {len(files_to_import)} files...**\n\n"
+                f"📤 **Importing {len(files_to_import)} files{' with folders' if import_type == 'import_with_folders' else ''}...**\n\n"
                 "This may take a while. Please wait..."
             )
 
@@ -2686,11 +2732,28 @@ class TGFSBot:
                 file_info = file_data['file_info']
 
                 try:
+                    # Determine target path based on import type
+                    if import_type == 'import_with_folders':
+                        # Create folder from filename
+                        folder_name = os.path.splitext(file_info['name'])[0]
+                        target_folder_path = import_session['current_path'].rstrip('/') + f'/{folder_name}/'
+
+                        # Create the folder
+                        if not await self.create_folder(target_folder_path):
+                            logger.error(f"Failed to create folder: {target_folder_path}")
+                            failed_files.append(file_info['name'])
+                            continue
+
+                        target_path = target_folder_path
+                    else:
+                        # Regular import to current path
+                        target_path = import_session['current_path']
+
                     # Upload to storage channel
                     if self.enable_upload_records:
                         await client.send_message(
                             chat_id=self.storage_channel_id,
-                            text=f"File: {file_info['name']}\nFrom: @{callback_query.from_user.username or callback_query.from_user.first_name}\nTarget: {import_session['current_path']}"
+                            text=f"File: {file_info['name']}\nFrom: @{callback_query.from_user.username or callback_query.from_user.first_name}\nTarget: {target_path}"
                         )
 
                     # Send file to storage channel based on type
@@ -2733,7 +2796,7 @@ class TGFSBot:
 
                     # Import file using TGFS API
                     success = await self.import_file(
-                        directory=import_session['current_path'],
+                        directory=target_path,
                         filename=file_info['name'],
                         channel_id=self.storage_channel_id,
                         message_id=storage_msg.id
@@ -2749,7 +2812,8 @@ class TGFSBot:
                     failed_files.append(file_info['name'])
 
             # Show results
-            result_text = f"📥 **Import Complete**\n\n"
+            import_type_text = "with folders" if import_type == 'import_with_folders' else ""
+            result_text = f"📥 **Import Complete {import_type_text}**\n\n"
             result_text += f"✅ Successfully imported: {success_count}/{len(files_to_import)} files\n"
 
             if failed_files:
