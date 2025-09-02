@@ -3,17 +3,17 @@
 import os
 import re
 import time
+import aiohttp
 import asyncio
 import logging
-import aiohttp
 from datetime import datetime
 from dotenv import load_dotenv
-from urllib.parse import unquote
 import xml.etree.ElementTree as ET
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from typing import Dict, List, Optional
 from pyrogram import utils as pyroutils
+from urllib.parse import unquote, quote
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 logging.basicConfig(
@@ -183,6 +183,9 @@ class TGFSBot:
                 ) as response:
                     if response.status == 207:
                         xml_content = await response.text()
+                        # Start background task to clean up completed tasks for this path
+                        asyncio.create_task(self.cleanup_completed_tasks(path))
+
                         return self.parse_webdav_response(xml_content, path)
                     else:
                         logger.error(f"Failed to get folder structure: {response.status}")
@@ -190,6 +193,99 @@ class TGFSBot:
         except Exception as e:
             logger.error(f"Error getting folder structure: {e}")
             return []
+
+    async def get_active_tasks(self, path: str) -> List[Dict]:
+        """Get active tasks for a specific path from TGFS API"""
+        try:
+            headers = await self.get_auth_headers()
+
+            # URL encode the path
+            encoded_path = quote(path, safe='')
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                        f"{self.tgfs_base_url}/api/tasks?path={encoded_path}",
+                        headers=headers
+                ) as response:
+                    if response.status == 200:
+                        tasks = await response.json()
+                        return tasks
+                    else:
+                        logger.error(f"Failed to get active tasks: {response.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"Error getting active tasks: {e}")
+            return []
+
+    async def cleanup_completed_tasks(self, path: str):
+        """Clean up completed tasks for a specific path in the background"""
+        try:
+            # Get active tasks for the path
+            tasks = await self.get_active_tasks(path)
+
+            if not tasks:
+                return
+
+            # Filter completed tasks
+            old_tasks = [task for task in tasks if task.get('status') in ['completed', 'failed', 'cancelled']]
+
+            if not old_tasks:
+                return
+
+            logger.info(f"Found {len(old_tasks)} completed tasks to clean up for path: {path}")
+
+            # Delete completed tasks
+            delete_tasks = []
+            for task in old_tasks:
+                task_id = task.get('id')
+                if task_id:
+                    delete_tasks.append(self.delete_task(task_id))
+
+            if delete_tasks:
+                results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+                # Log results
+                success_count = sum(1 for result in results if result is True)
+                failure_count = len(results) - success_count
+
+                if success_count > 0:
+                    logger.info(f"Successfully deleted {success_count} completed tasks")
+                if failure_count > 0:
+                    logger.warning(f"Failed to delete {failure_count} tasks")
+
+        except Exception as e:
+            logger.error(f"Error in cleanup_completed_tasks: {e}")
+
+    async def delete_task(self, task_id: str) -> bool:
+        """Delete a specific task by ID"""
+        try:
+            headers = await self.get_auth_headers()
+
+            async with aiohttp.ClientSession() as session:
+                # First check if the task exists with OPTIONS
+                async with session.options(
+                        f"{self.tgfs_base_url}/api/tasks/{task_id}",
+                        headers=headers
+                ) as options_response:
+                    if options_response.status != 200:
+                        logger.debug(f"Task {task_id} doesn't exist or OPTIONS failed: {options_response.status}")
+                        return False
+
+                # Then delete the task
+                async with session.delete(
+                        f"{self.tgfs_base_url}/api/tasks/{task_id}",
+                        headers=headers
+                ) as delete_response:
+                    if delete_response.status == 200:
+                        logger.info(f"Successfully deleted completed task: {task_id}")
+                        return True
+                    else:
+                        logger.error(f"Failed to delete task {task_id}: {delete_response.status}")
+                        return False
+
+        except Exception as e:
+            logger.error(f"Error deleting task {task_id}: {e}")
+            return False
 
     @staticmethod
     def parse_number_list(text: str) -> List[int]:
