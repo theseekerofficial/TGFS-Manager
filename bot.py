@@ -11,7 +11,6 @@ from dotenv import load_dotenv
 
 import aiohttp
 from pyrogram import Client, filters
-from pyrogram.enums import ParseMode
 from pyrogram.errors import FloodWait
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardButton,
@@ -47,8 +46,6 @@ class TGFSBot:
         self.big_flood_wait = int(os.getenv('BIG_FLOOD_WAIT', '320'))
         self.path_cache: Dict[str, str] = {}
         self.reverse_path_cache: Dict[str, str] = {}
-        self.import_sessions: Dict[str, dict] = {}
-        self.index_sessions: Dict[str, dict] = {}
         self.cache_counter = 0
 
         # TGFS API settings
@@ -60,8 +57,10 @@ class TGFSBot:
         self.auth_token: Optional[str] = None
         self.user_sessions: Dict[int, dict] = {}
         self.file_sessions: Dict[str, dict] = {}
+        self.import_sessions: Dict[str, dict] = {}
+        self.index_sessions: Dict[str, dict] = {}
 
-        # Initialize Pyrogram client
+        # Initialize Pyrogram client variable
         self.app = None
 
     def register_handlers(self):
@@ -109,7 +108,7 @@ class TGFSBot:
             elif message.text and message.text.startswith('/'):
                 await self.handle_command(client, message)
             elif message.text:
-                # Handle text messages (for folder creation)
+                # Handle text messages (for folder creation, channel indexing, etc.)
                 await self.handle_text_message(client, message)
 
         @self.app.on_callback_query()
@@ -345,8 +344,8 @@ class TGFSBot:
                 "🤖 **TGFS File Manager Bot**\n\n"
                 "Send me any file (photo, video, document, audio) and I'll help you organize it in your TGFS storage!\n\n"
                 "Commands:\n"
-                "• Send a file - Start file organization\n"
-                "• /browse - Browse folder structure\n"
+                "• Send or forward a file(s) - Start file organization and importing\n"
+                "• /browse - Manage files, Upload/Import multiple files, Browse folder structure\n"
                 "• /indexchannel - Index/Import files from a channel to TGFS Server"
             )
         elif message.text == '/browse':
@@ -372,9 +371,8 @@ class TGFSBot:
                 await self.handle_index_session_text(client, message, index_session_id, index_session)
                 return
 
-        # Check if this is a reply to one of our file messages
         if not message.reply_to_message:
-            return  # Not a reply to our message
+            return
 
         for import_session_id, import_session in self.import_sessions.items():
             if (import_session['user_id'] == user_id and
@@ -391,7 +389,7 @@ class TGFSBot:
                 break
 
         if not target_file_session_id:
-            return  # Not a reply to our folder creation prompt
+            return
 
         file_session = self.file_sessions[target_file_session_id]
 
@@ -422,13 +420,12 @@ class TGFSBot:
                 file_session['current_path'] = new_folder_path
                 file_session['waiting_for'] = None
                 file_session['target_path'] = None
-                file_session['expecting_reply_to'] = None  # Clear the reply expectation
+                file_session['expecting_reply_to'] = None
 
                 keyboard = await self.create_folder_keyboard(new_folder_path, target_file_session_id)
 
                 # Update the original file message with new keyboard
                 try:
-                    # First try to just update the keyboard (avoids MESSAGE_NOT_MODIFIED)
                     await client.edit_message_text(
                         chat_id=message.chat.id,
                         message_id=file_session.get('reply_message_id'),
@@ -445,7 +442,7 @@ class TGFSBot:
 
                 except Exception as e:
                     logger.error(f"Failed to update message.: {e}. Retrying with edit_message_reply_markup.")
-                    # If that fails, try to update the entire message
+                    # If that fails, try to update the buttons only
                     try:
                         await client.edit_message_reply_markup(
                             chat_id=message.chat.id,
@@ -543,7 +540,6 @@ class TGFSBot:
     async def handle_index_session_text(self, client, message: Message, index_session_id: str, index_session: dict):
         """Handle text input for channel indexing"""
         if index_session.get('step') == 'waiting_channel_id':
-            # Parse channel ID
             try:
                 channel_id = int(message.text.strip())
                 if channel_id >= 0:
@@ -555,7 +551,6 @@ class TGFSBot:
                                     reply_to_message_id=message.reply_to_message.id)
                 return
 
-            # Test channel access
             await client.edit_message_text(
                 chat_id=message.chat.id,
                 message_id=index_session['reply_message_id'],
@@ -766,7 +761,7 @@ class TGFSBot:
         items = await self.get_folder_structure(current_path)
         keyboard = []
 
-        # Add folder navigation (only folders, no files)
+        # Add folder navigation
         folders = [item for item in items if item['is_directory']]
 
         for folder in folders:
@@ -779,7 +774,7 @@ class TGFSBot:
         action_row_1 = []
         action_row_2 = []
 
-        # Back button (if not at root)
+        # Back button
         if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
             parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
             if parent_path == '/webdav':
@@ -903,7 +898,7 @@ class TGFSBot:
                 current_message_id += 1
                 index_session['current_message_id'] = current_message_id
 
-                # Small delay to avoid rate limits (but not during flood wait)
+                # Small delay to avoid rate limits
                 if not index_session.get('flood_wait_until'):
                     await asyncio.sleep(self.small_flood_wait)
 
@@ -1051,7 +1046,6 @@ class TGFSBot:
                     else:
                         eta_text = "Calculating..."
 
-                # Create progress bar
                 bar_length = 20
                 filled_length = int(bar_length * processed // total)
                 bar = "█" * filled_length + "░" * (bar_length - filled_length)
@@ -1137,7 +1131,7 @@ class TGFSBot:
             return
 
         # Get items to delete
-        items_to_delete = [all_items[n - 1] for n in valid_numbers]  # Convert to 0-based index
+        items_to_delete = [all_items[n - 1] for n in valid_numbers]
 
         # Store in session for confirmation
         file_session['delete_multiple_items'] = items_to_delete
@@ -1203,7 +1197,7 @@ class TGFSBot:
             'file_info': file_info,
             'current_path': current_path,
             'user_id': user_id,
-            'created_time': time.time(),  # For session cleanup
+            'created_time': time.time(),
             'waiting_for': None,
             'target_path': None,
             'expecting_reply_to': None,
@@ -1295,13 +1289,13 @@ class TGFSBot:
         # Separate folders and files
         folders = [item for item in items if item['is_directory']]
         files = [item for item in items if not item['is_directory']]
-        all_items = folders + files  # Folders first, then files
+        all_items = folders + files
 
         # Calculate pagination
         total_items = len(all_items)
-        total_pages = (total_items + items_per_page - 1) // items_per_page  # Ceiling division
+        total_pages = (total_items + items_per_page - 1) // items_per_page
 
-        # Add pagination numbers at top (if more than 1 page)
+        # Add pagination numbers at top, if more than 1 page
         if total_pages > 1:
             page_buttons = []
 
@@ -1393,18 +1387,18 @@ class TGFSBot:
                 InlineKeyboardButton("⬅️ Back", callback_data=f"nav:{file_session_id}:{parent_hash}")
             )
 
-        # Select current location (for file uploads) - use hash
+        # Select current location (for file uploads)
         current_hash = self.get_path_hash(current_path)
         action_row_1.append(
             InlineKeyboardButton("✅ Select Here", callback_data=f"select:{file_session_id}:{current_hash}")
         )
 
-        # Create new folder - use hash
+        # Create new folder
         action_row_2.append(
             InlineKeyboardButton("➕ New Folder", callback_data=f"newfolder:{file_session_id}:{current_hash}")
         )
 
-        # Create folder from filename - use hash
+        # Create folder from filename
         action_row_2.append(
             InlineKeyboardButton("📂 Folder from File Name",
                                  callback_data=f"folderfromname:{file_session_id}:{current_hash}")
@@ -1552,13 +1546,13 @@ class TGFSBot:
                 InlineKeyboardButton("⬅️ Back", callback_data=f"browse_nav:{import_session_id}:{parent_hash}")
             )
 
-        # Import Files button - use hash
+        # Import Files button
         current_hash = self.get_path_hash(current_path)
         action_row_1.append(
             InlineKeyboardButton("📥 Import Files", callback_data=f"import_files:{import_session_id}:{current_hash}")
         )
 
-        # Create new folder - use hash
+        # Create new folder
         action_row_2.append(
             InlineKeyboardButton("➕ New Folder", callback_data=f"browse_newfolder:{import_session_id}:{current_hash}")
         )
@@ -2353,7 +2347,7 @@ class TGFSBot:
             await callback_query.answer("Confirm file deletion")
 
         elif action == "delete_yes":
-            # Confirm deletion (handles both files and folders)
+            # Confirm deletion
             item_path = self.get_path_from_hash(path_hash)
             if not item_path:
                 await callback_query.answer("Invalid path", show_alert=True)
@@ -2403,7 +2397,7 @@ class TGFSBot:
                     del file_session[key]
 
         elif action == "delete_no":
-            # Cancel deletion - go back to normal view
+            # Cancel deletion and go back to normal view
             current_path = file_session['current_path']
 
             # Restore normal keyboard
@@ -2470,9 +2464,6 @@ class TGFSBot:
 
             await callback_query.edit_message_text("🗑️ **Deleting multiple items... This may take a while.**")
 
-            success_count = 0
-            failed_items = []
-
             # Delete items concurrently
             delete_tasks = [self.delete_item(item['path']) for item in items_to_delete]
             results = await asyncio.gather(*delete_tasks, return_exceptions=True)
@@ -2517,7 +2508,7 @@ class TGFSBot:
                     del file_session[key]
 
         elif action == "delete_multiple_no":
-            # Cancel multiple deletion - go back to normal view
+            # Cancel multiple deletion and go back to normal view
             current_path = file_session['current_path']
 
             # Restore normal keyboard
@@ -2831,7 +2822,7 @@ class TGFSBot:
     async def cleanup_old_sessions(self):
         """Clean up old file and import sessions periodically"""
         while True:
-            await asyncio.sleep(3600)  # Clean up every hour
+            await asyncio.sleep(3600)
             current_time = time.time()
             expired_file_sessions = []
             expired_import_sessions = []
@@ -2857,9 +2848,9 @@ class TGFSBot:
                 # 2. OR sessions that failed/completed and are old (6+ hours)
                 should_cleanup = False
 
-                if session_age > 86400 and not is_running:  # 24 hours, not running
+                if session_age > 86400 and not is_running:
                     should_cleanup = True
-                elif session_age > 21600 and (session.get('completed') or session.get('error')):  # 6 hours, finished
+                elif session_age > 21600 and (session.get('completed') or session.get('error')):
                     should_cleanup = True
 
                 if should_cleanup:
