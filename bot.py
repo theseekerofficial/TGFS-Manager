@@ -1,24 +1,21 @@
+# TGFS Manager Pyro Bot
+
 import os
 import re
+import time
 import asyncio
 import logging
-import time
-from typing import Dict, List, Optional
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from urllib.parse import unquote
-from dotenv import load_dotenv
-
 import aiohttp
+from datetime import datetime
+from dotenv import load_dotenv
+from urllib.parse import unquote
+import xml.etree.ElementTree as ET
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
-from pyrogram.types import (
-    Message, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, BotCommand
-)
+from typing import Dict, List, Optional
 from pyrogram import utils as pyroutils
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
-# Configure logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
