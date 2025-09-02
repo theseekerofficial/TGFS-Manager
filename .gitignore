@@ -1,0 +1,13 @@
+# Python bytecode and cache
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+
+# IDE/editor settings
+.idea/
+.vscode/
+*.sublime-workspace
+*.sublime-project
+
+settings.env

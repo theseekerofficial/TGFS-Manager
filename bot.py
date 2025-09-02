@@ -1,0 +1,2183 @@
+import os
+import re
+import asyncio
+import logging
+import time
+from typing import Dict, List, Optional
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from urllib.parse import unquote
+from dotenv import load_dotenv
+
+import aiohttp
+from pyrogram import Client, filters
+from pyrogram.types import (
+    Message, CallbackQuery, InlineKeyboardButton,
+    InlineKeyboardMarkup, BotCommand
+)
+from pyrogram import utils as pyroutils
+
+# Configure logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+ROOT_FOLDER_NAME = os.getenv('TGFS_ROOT_CHANNEL_NAME', '') if os.getenv('TGFS_ROOT_CHANNEL_NAME', '') != '/' else ''
+
+pyroutils.MIN_CHAT_ID = -999999999999
+pyroutils.MIN_CHANNEL_ID = -100999999999999
+
+class TGFSBot:
+    def __init__(self):
+        # Load environment variables
+        self.bot_token = os.getenv('BOT_TOKEN')
+        self.api_id = int(os.getenv('API_ID', '0'))
+        self.api_hash = os.getenv('API_HASH', '')
+        self.allowed_user_id = int(os.getenv('ALLOWED_USER_ID', '0'))
+        self.storage_channel_id = int(os.getenv('STORAGE_CHANNEL_ID', '0'))
+        self.enable_upload_records = os.getenv('ENABLE_UPLOAD_RECORDS', 'False').lower() in ['true', '1', 't']
+        self.path_cache: Dict[str, str] = {}
+        self.reverse_path_cache: Dict[str, str] = {}
+        self.import_sessions: Dict[str, dict] = {}
+        self.cache_counter = 0
+
+        # TGFS API settings
+        self.tgfs_base_url = os.getenv('TGFS_BASE_URL', 'https://tg-webdav.mlwa.xyz')
+        self.tgfs_username = os.getenv('TGFS_USERNAME', 'admin')
+        self.tgfs_password = os.getenv('TGFS_PASSWORD', 'password')
+
+        # Global state
+        self.auth_token: Optional[str] = None
+        self.user_sessions: Dict[int, dict] = {}
+        self.file_sessions: Dict[str, dict] = {}
+
+        # Initialize Pyrogram client
+        self.app = None
+
+    def register_handlers(self):
+        """Register all message and callback handlers"""
+
+        # Group message handler (only for groups)
+        @self.app.on_message(filters.group)
+        async def handle_group_message(client, message: Message):
+            await message.reply("Please use TGFS Indexer Bot in Private Chat.", reply_to_message_id=message.id)
+
+        # Main message handler (only for private chats)
+        @self.app.on_message(filters.private)
+        async def handle_private_message(client, message: Message):
+            # Check if user is authorized
+            if message.from_user.id != self.allowed_user_id:
+                await message.reply("Unauthorized", reply_to_message_id=message.id)
+                return
+
+            items = list(self.import_sessions.items())
+            display_msg = False
+            for i, (import_session_id, import_session) in enumerate(items):
+                if i == len(items) - 1:
+                    display_msg = True
+                user_id = message.from_user.id
+                if (import_session['user_id'] == user_id and
+                        import_session.get('waiting_for_files') and
+                        any([message.video, message.document, message.audio, message.voice, message.video_note])):
+                    await self.handle_import_session_file(client, message, import_session_id, import_session, display_message=display_msg)
+                    return
+
+            if message.photo:
+                await message.reply("Please send this image as a file. 📃", reply_to_message_id=message.id)
+                return
+
+            if any([message.video, message.document, message.audio, message.voice, message.video_note]):
+                await self.handle_media_upload(client, message)
+            elif message.text and message.text.startswith('/'):
+                await self.handle_command(client, message)
+            elif message.text:
+                # Handle text messages (for folder creation)
+                await self.handle_text_message(client, message)
+
+        @self.app.on_callback_query()
+        async def handle_callback(client, callback_query: CallbackQuery):
+            if callback_query.from_user.id != self.allowed_user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            await self.handle_callback_query(client, callback_query)
+
+    def get_path_hash(self, path: str) -> str:
+        """Generate a short hash for a path"""
+        if path in self.reverse_path_cache:
+            return self.reverse_path_cache[path]
+
+        # Use a simple counter-based hash to keep it short
+        hash_str = f"p{self.cache_counter}"
+        self.cache_counter += 1
+
+        self.path_cache[hash_str] = path
+        self.reverse_path_cache[path] = hash_str
+        return hash_str
+
+    def get_path_from_hash(self, hash_str: str) -> Optional[str]:
+        """Retrieve path from hash"""
+        return self.path_cache.get(hash_str)
+
+    async def authenticate(self) -> bool:
+        """Authenticate with TGFS API and store token"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                login_data = {
+                    "username": self.tgfs_username,
+                    "password": self.tgfs_password
+                }
+
+                async with session.post(
+                        f"{self.tgfs_base_url}/login",
+                        json=login_data,
+                        headers={"Content-Type": "application/json"}
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        self.auth_token = result.get('token')
+                        logger.info("Successfully authenticated with TGFS API")
+                        return True
+                    else:
+                        logger.error(f"Authentication failed: {response.status}")
+                        return False
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return False
+
+    async def get_auth_headers(self) -> Dict[str, str]:
+        """Get authorization headers, authenticate if needed"""
+        if not self.auth_token:
+            await self.authenticate()
+
+        return {
+            "Authorization": f"Bearer {self.auth_token}",
+            "Content-Type": "application/json"
+        }
+
+    async def get_folder_structure(self, path: str = f"/webdav/{ROOT_FOLDER_NAME}") -> List[Dict]:
+        """Get folder structure (both folders and files) from TGFS WebDAV"""
+        try:
+            headers = await self.get_auth_headers()
+            headers["Depth"] = "1"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                        "PROPFIND",
+                        f"{self.tgfs_base_url}{path}",
+                        headers=headers
+                ) as response:
+                    if response.status == 207:
+                        xml_content = await response.text()
+                        return self.parse_webdav_response(xml_content, path)
+                    else:
+                        logger.error(f"Failed to get folder structure: {response.status}")
+                        return []
+        except Exception as e:
+            logger.error(f"Error getting folder structure: {e}")
+            return []
+
+    @staticmethod
+    def parse_number_list(text: str) -> List[int]:
+        text = text.strip()
+
+        text = re.sub(r'[,\s]+', ' ', text)
+        numbers = []
+
+        for part in text.split():
+            try:
+                num = int(part)
+                if num > 0:
+                    numbers.append(num)
+            except ValueError:
+                continue
+
+        return sorted(list(set(numbers)))
+
+    @staticmethod
+    def parse_webdav_response(xml_content: str, current_path: str) -> List[Dict]:
+        """Parse WebDAV XML response to extract folder and file information"""
+        items = []
+        try:
+            root = ET.fromstring(xml_content)
+
+            # Define namespace
+            namespaces = {'D': 'DAV:'}
+
+            for response in root.findall('.//D:response', namespaces):
+                href_elem = response.find('D:href', namespaces)
+                if href_elem is not None:
+                    href = href_elem.text
+
+                    # Normalize paths for comparison
+                    normalized_href = href.rstrip('/')
+                    normalized_current = current_path.rstrip('/')
+
+                    if normalized_href == normalized_current:
+                        continue
+
+                    # Check if it's a directory or file
+                    collection_elem = response.find('.//D:collection', namespaces)
+                    is_directory = collection_elem is not None
+
+                    # Get display name
+                    display_name_elem = response.find('.//D:displayname', namespaces)
+                    display_name = display_name_elem.text if display_name_elem is not None else href.split('/')[-1]
+
+                    # Get content length for files
+                    content_length = 0
+                    if not is_directory:
+                        content_length_elem = response.find('.//D:getcontentlength', namespaces)
+                        if content_length_elem is not None:
+                            try:
+                                content_length = int(content_length_elem.text)
+                            except (ValueError, TypeError):
+                                content_length = 0
+
+                    items.append({
+                        'path': href,
+                        'name': display_name,
+                        'is_directory': is_directory,
+                        'size': content_length
+                    })
+        except Exception as e:
+            logger.error(f"Error parsing WebDAV response: {e}")
+
+        return items
+
+    async def create_folder(self, folder_path: str) -> bool:
+        """Create a new folder using WebDAV MKCOL"""
+        try:
+            headers = await self.get_auth_headers()
+            del headers["Content-Type"]  # MKCOL doesn't need Content-Type
+
+            # Ensure path ends with /
+            if not folder_path.endswith('/'):
+                folder_path += '/'
+
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                        "MKCOL",
+                        f"{self.tgfs_base_url}{folder_path}",
+                        headers=headers
+                ) as response:
+                    return response.status in [201, 204]
+        except Exception as e:
+            logger.error(f"Error creating folder: {e}")
+            return False
+
+    async def import_file(self, directory: str, filename: str, channel_id: int, message_id: int) -> bool:
+        """Import file using TGFS API"""
+        try:
+            headers = await self.get_auth_headers()
+
+            # Remove /webdav prefix from directory for import API
+            if directory.startswith('/webdav'):
+                directory = directory.removeprefix('/webdav')  # Remove '/webdav'
+
+            import_data = {
+                "directory": unquote(directory),
+                "name": filename,
+                "channel_id": int(str(channel_id).removeprefix("-100")),
+                "message_id": message_id
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        f"{self.tgfs_base_url}/api/import",
+                        json=import_data,
+                        headers=headers
+                ) as response:
+                    if response.status == 200:
+                        return True
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Import failed: {response.status} - {error_text}")
+                        return False
+        except Exception as e:
+            logger.error(f"Error importing file: {e}")
+            return False
+
+    async def delete_item(self, item_path: str) -> bool:
+        """Delete a file or folder using WebDAV DELETE"""
+        try:
+            headers = await self.get_auth_headers()
+            if "Content-Type" in headers:
+                del headers["Content-Type"]
+
+            async with aiohttp.ClientSession() as session:
+                async with session.request(
+                        "DELETE",
+                        f"{self.tgfs_base_url}{item_path}",
+                        headers=headers,
+                        timeout=300
+                ) as response:
+                    return response.status in [200, 204]
+        except asyncio.TimeoutError:
+            logger.error(f"Delete operation timed out for: {item_path}")
+            return False
+        except Exception as e:
+            logger.error(f"Error deleting item: {e}")
+            return False
+
+    async def handle_command(self, client, message: Message):
+        """Handle bot commands"""
+        if message.text == '/start':
+            await message.reply(
+                "🤖 **TGFS File Manager Bot**\n\n"
+                "Send me any file (photo, video, document, audio) and I'll help you organize it in your TGFS storage!\n\n"
+                "Commands:\n"
+                "• Send a file - Start file organization\n"
+                "• /browse - Browse folder structure"
+            )
+        elif message.text == '/browse':
+            await self.handle_browse_command(client, message)
+
+    async def handle_text_message(self, client, message: Message):
+        """Handle text messages for folder creation with file session support"""
+        user_id = message.from_user.id
+
+        # Check if this is a reply to one of our file messages
+        if not message.reply_to_message:
+            return  # Not a reply to our message
+
+        for import_session_id, import_session in self.import_sessions.items():
+            if (import_session['user_id'] == user_id and
+                    import_session.get('expecting_reply_to') == message.reply_to_message.id):
+                await self.handle_import_session_text(client, message, import_session_id, import_session)
+                return
+
+        # Find which file session this reply belongs to
+        target_file_session_id = None
+        for file_session_id, file_session in self.file_sessions.items():
+            if (file_session['user_id'] == user_id and
+                    file_session.get('expecting_reply_to') == message.reply_to_message.id):
+                target_file_session_id = file_session_id
+                break
+
+        if not target_file_session_id:
+            return  # Not a reply to our folder creation prompt
+
+        file_session = self.file_sessions[target_file_session_id]
+
+        if file_session.get('waiting_for') == 'delete_numbers':
+            await self.handle_delete_multiple_input(client, message, target_file_session_id, file_session)
+            return
+
+        if file_session.get('waiting_for') == 'folder_name':
+            folder_name = message.text.strip()
+            target_path = file_session.get('target_path')
+
+            if not folder_name:
+                await message.reply("❌ Folder name cannot be empty. Please try again.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            # Create the new folder
+            new_folder_path = target_path.rstrip('/') + f'/{folder_name}/'
+
+            create_folder_message = await message.reply(
+                f"🔄 Creating folder `{folder_name}`...",
+                reply_to_message_id=message.reply_to_message.id
+            )
+
+            if await self.create_folder(new_folder_path):
+                # Update file session and show the new folder
+                await create_folder_message.delete()
+                file_session['current_path'] = new_folder_path
+                file_session['waiting_for'] = None
+                file_session['target_path'] = None
+                file_session['expecting_reply_to'] = None  # Clear the reply expectation
+
+                keyboard = await self.create_folder_keyboard(new_folder_path, target_file_session_id)
+
+                # Update the original file message with new keyboard
+                try:
+                    # First try to just update the keyboard (avoids MESSAGE_NOT_MODIFIED)
+                    await client.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=file_session.get('reply_message_id'),
+                        text=(
+                            f"📁 **File received:** `{file_session['file_info']['name']}`\n"
+                            f"📏 **Size:** {self.format_file_size(file_session['file_info']['size'])}\n"
+                            f"🗂 **Type:** {file_session['file_info']['type']}\n"
+                            f"🛣️ **Current Path:** `{unquote(new_folder_path)}`\n\n"
+                            f"**New Folder Created ✅**\n\n"
+                            "**Please select destination folder:**"
+                        ),
+                        reply_markup=keyboard
+                    )
+
+                except Exception as e:
+                    logger.error(f"Failed to update message.: {e}. Retrying with edit_message_reply_markup.")
+                    # If that fails, try to update the entire message
+                    try:
+                        await client.edit_message_reply_markup(
+                            chat_id=message.chat.id,
+                            message_id=file_session.get('reply_message_id'),
+                            reply_markup=keyboard
+                        )
+                    except Exception as e2:
+                        logger.error(f"Failed to update message: {e2}. Sending new message.")
+                        await message.delete()
+                        # Fallback: send new message
+                        await message.reply(
+                            f"✅ Folder `{folder_name}` created successfully!\n\n"
+                            f"Current location: `{new_folder_path}`",
+                            reply_markup=keyboard,
+                            reply_to_message_id=file_session.get('reply_message_id')
+                        )
+            else:
+                await message.reply(
+                    "❌ Failed to create folder. Please try again.",
+                    reply_to_message_id=message.reply_to_message.id
+                )
+
+            await message.delete()
+            if 'prompt_message_id' in file_session:
+                try:
+                    await client.delete_messages(message.chat.id, file_session['prompt_message_id'])
+                except Exception as e:
+                    logger.error(f"Failed to delete prompt message: {e}")
+                    pass
+
+            # Clean up the waiting state
+            file_session['waiting_for'] = None
+            file_session['target_path'] = None
+
+    async def handle_browse_command(self, client, message: Message):
+        """Handle /browse command to browse folders without file upload"""
+        user_id = message.from_user.id
+
+        # Generate a unique browse session ID
+        import_session_id = f"browse_{user_id}_{message.id}"
+        current_path = f'/webdav/{ROOT_FOLDER_NAME}'
+
+        # Store import session
+        self.import_sessions[import_session_id] = {
+            'user_id': user_id,
+            'current_path': current_path,
+            'created_time': time.time(),
+            'current_page': 1,
+            'items_per_page': 10,
+            'files_to_import': [],  # Store files for batch import
+            'waiting_for_files': False,
+            'original_message_id': message.id
+        }
+
+        # Send browsing message
+        reply_msg = await message.reply(
+            f"📁 **Browse Mode**\n"
+            f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+            "**Select folder to browse or import files:**",
+            reply_markup=await self.create_browse_keyboard(current_path, import_session_id),
+            reply_to_message_id=message.id
+        )
+
+        # Store the reply message ID for later updates
+        self.import_sessions[import_session_id]['reply_message_id'] = reply_msg.id
+
+    async def handle_delete_multiple_input(self, client, message: Message, file_session_id: str, file_session: dict):
+        """Handle user input for delete multiple numbers"""
+        numbers = self.parse_number_list(message.text)
+
+        if not numbers:
+            await message.reply("❌ No valid numbers found. Please send numbers like '1,2,3' or '1 2 3'.",
+                                reply_to_message_id=message.reply_to_message.id)
+            return
+
+        # Get current folder items
+        current_path = file_session['current_path']
+        items = await self.get_folder_structure(current_path)
+
+        # Separate folders and files, then combine
+        folders = [item for item in items if item['is_directory']]
+        files = [item for item in items if not item['is_directory']]
+        all_items = folders + files
+
+        # Validate numbers
+        valid_numbers = [n for n in numbers if 1 <= n <= len(all_items)]
+        invalid_numbers = [n for n in numbers if n not in valid_numbers]
+
+        if invalid_numbers:
+            await message.reply(
+                f"❌ Invalid numbers: {', '.join(map(str, invalid_numbers))}. "
+                f"Valid range: 1-{len(all_items)}",
+                reply_to_message_id=message.reply_to_message.id
+            )
+            return
+
+        # Get items to delete
+        items_to_delete = [all_items[n - 1] for n in valid_numbers]  # Convert to 0-based index
+
+        # Store in session for confirmation
+        file_session['delete_multiple_items'] = items_to_delete
+        file_session['delete_multiple_numbers'] = valid_numbers
+        file_session['waiting_for'] = None
+        file_session['expecting_reply_to'] = None
+
+        # Create confirmation message
+        items_list = "\n".join([f"{n}. {'📁' if item['is_directory'] else '📄'} {item['name']}"
+                                for n, item in zip(valid_numbers, items_to_delete)])
+
+        confirmation_keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("✅ Yes, Delete Selected",
+                                     callback_data=f"delete_multiple_yes:{file_session_id}:{file_session['current_hash']}"),
+                InlineKeyboardButton("❌ Cancel",
+                                     callback_data=f"delete_multiple_no:{file_session_id}:{file_session['current_hash']}")
+            ]
+        ])
+
+        # Update the original message
+        try:
+            await client.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=file_session.get('reply_message_id'),
+                text=(
+                    f"🗑️ **Confirm Multiple Deletion**\n\n"
+                    f"You selected {len(valid_numbers)} items to delete:\n\n"
+                    f"{items_list}\n\n"
+                    "Are you sure you want to delete these items?"
+                ),
+                reply_markup=confirmation_keyboard
+            )
+        except Exception as e:
+            logger.error(f"Failed to update message: {e}")
+
+        # Clean up messages
+        await message.delete()
+        if 'prompt_message_id' in file_session:
+            try:
+                await client.delete_messages(message.chat.id, file_session['prompt_message_id'])
+                del file_session['prompt_message_id']
+            except Exception as e:
+                logger.error(f"Failed to delete prompt message: {e}")
+
+    async def handle_media_upload(self, client, message: Message):
+        """Handle file uploads from user - supports multiple files"""
+        user_id = message.from_user.id
+
+        # Determine file info
+        file_info = self.extract_file_info(message)
+        if not file_info:
+            await message.reply("❌ Unsupported file type", reply_to_message_id=message.id)
+            return
+
+        # Generate a unique session ID for this file
+        file_session_id = f"{user_id}_{message.id}"
+        current_path = f'/webdav/{ROOT_FOLDER_NAME}'
+
+        # Store file session
+        self.file_sessions[file_session_id] = {
+            'original_message': message,
+            'file_info': file_info,
+            'current_path': current_path,
+            'user_id': user_id,
+            'created_time': time.time(),  # For session cleanup
+            'waiting_for': None,
+            'target_path': None,
+            'expecting_reply_to': None,
+            'current_page': 1,
+            'items_per_page': 10
+        }
+
+        # Store in user session for easy access
+        if user_id not in self.user_sessions:
+            self.user_sessions[user_id] = {'file_sessions': []}
+        self.user_sessions[user_id]['file_sessions'].append(file_session_id)
+
+        # Send file received message with reply to the original file
+        reply_msg = await message.reply(
+            f"📁 **File received:** `{file_info['name']}`\n"
+            f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+            f"🗂 **Type:** {file_info['type']}\n"
+            f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+            "**Please select destination folder:**",
+            reply_to_message_id=message.id,
+            reply_markup=await self.create_folder_keyboard(current_path, file_session_id)
+        )
+
+        # Store the reply message ID for later updates
+        self.file_sessions[file_session_id]['reply_message_id'] = reply_msg.id
+
+    @staticmethod
+    def extract_file_info(message: Message) -> Optional[Dict]:
+        """Extract file information from message"""
+        if message.video:
+            return {
+                'name': message.video.file_name or f"video_{message.id}.mp4",
+                'size': message.video.file_size,
+                'type': 'Video',
+                'file_id': message.video.file_id
+            }
+        elif message.document:
+            return {
+                'name': message.document.file_name or f"document_{message.id}",
+                'size': message.document.file_size,
+                'type': 'Document',
+                'file_id': message.document.file_id
+            }
+        elif message.audio:
+            return {
+                'name': message.audio.file_name or f"audio_{message.id}.mp3",
+                'size': message.audio.file_size,
+                'type': 'Audio',
+                'file_id': message.audio.file_id
+            }
+        elif message.voice:
+            return {
+                'name': f"voice_{message.id}.ogg",
+                'size': message.voice.file_size,
+                'type': 'Voice',
+                'file_id': message.voice.file_id
+            }
+        elif message.video_note:
+            return {
+                'name': f"video_note_{message.id}.mp4",
+                'size': message.video_note.file_size,
+                'type': 'Video Note',
+                'file_id': message.video_note.file_id
+            }
+        return None
+
+    @staticmethod
+    def format_file_size(size_bytes: int) -> str:
+        """Format file size in human readable format"""
+        if size_bytes == 0:
+            return "0 B"
+        size_names = ["B", "KB", "MB", "GB", "TB"]
+        import math
+        i = int(math.floor(math.log(size_bytes, 1024)))
+        p = math.pow(1024, i)
+        s = round(size_bytes / p, 2)
+        return f"{s} {size_names[i]}"
+
+    async def create_folder_keyboard(self, current_path: str, file_session_id: str) -> InlineKeyboardMarkup:
+        """Create inline keyboard for folder and file navigation with pagination"""
+        items = await self.get_folder_structure(current_path)
+        keyboard = []
+
+        # Get pagination info from file session
+        file_session = self.file_sessions.get(file_session_id, {})
+        current_page = file_session.get('current_page', 1)
+        items_per_page = file_session.get('items_per_page', 10)
+
+        # Separate folders and files
+        folders = [item for item in items if item['is_directory']]
+        files = [item for item in items if not item['is_directory']]
+        all_items = folders + files  # Folders first, then files
+
+        # Calculate pagination
+        total_items = len(all_items)
+        total_pages = (total_items + items_per_page - 1) // items_per_page  # Ceiling division
+
+        # Add pagination numbers at top (if more than 1 page)
+        if total_pages > 1:
+            page_buttons = []
+
+            if total_pages <= 10:
+                # Show all page numbers
+                for page in range(1, total_pages + 1):
+                    button_text = f"• {page} •" if page == current_page else str(page)
+                    page_buttons.append(
+                        InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                    )
+            else:
+                # Handle more than 10 pages
+                if current_page <= 8:
+                    # Show pages 1-8, ..., last_page
+                    for page in range(1, 9):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+                else:
+                    # Show 1, ..., current_page-1, current_page, current_page+1, ..., last_page
+                    page_buttons.append(
+                        InlineKeyboardButton("1", callback_data=f"page:{file_session_id}:1")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:1")
+                    )
+
+                    for page in range(max(2, current_page - 1), min(total_pages, current_page + 2)):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                        )
+
+                    if current_page < total_pages - 1:
+                        page_buttons.append(
+                            InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+
+            # Add page buttons in rows of 5
+            for i in range(0, len(page_buttons), 5):
+                keyboard.append(page_buttons[i:i + 5])
+
+        # Get items for current page
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_items = all_items[start_idx:end_idx]
+
+        # Add item buttons (1 per row) with numbering
+        item_number = 1
+        for item in page_items:
+            if item['is_directory']:
+                path_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(f"{item_number}. 📁 {item['name']}", callback_data=f"nav:{file_session_id}:{path_hash}")
+                ])
+            else:
+                file_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{item_number}. 📄 {item['name']} ({self.format_file_size(item['size'])})",
+                        callback_data=f"file_delete_confirm:{file_session_id}:{file_hash}"
+                    )
+                ])
+            item_number += 1
+
+        # Add action buttons
+        action_row_1 = []
+        action_row_2 = []
+        action_row_3 = []
+
+        # Back button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
+            if parent_path == '/webdav':
+                parent_path = f'/webdav/{ROOT_FOLDER_NAME}'
+
+            parent_hash = self.get_path_hash(parent_path)
+            action_row_1.append(
+                InlineKeyboardButton("⬅️ Back", callback_data=f"nav:{file_session_id}:{parent_hash}")
+            )
+
+        # Select current location (for file uploads) - use hash
+        current_hash = self.get_path_hash(current_path)
+        action_row_1.append(
+            InlineKeyboardButton("✅ Select Here", callback_data=f"select:{file_session_id}:{current_hash}")
+        )
+
+        # Create new folder - use hash
+        action_row_2.append(
+            InlineKeyboardButton("➕ New Folder", callback_data=f"newfolder:{file_session_id}:{current_hash}")
+        )
+
+        # Create folder from filename - use hash
+        action_row_2.append(
+            InlineKeyboardButton("📂 Folder from File Name",
+                                 callback_data=f"folderfromname:{file_session_id}:{current_hash}")
+        )
+
+        # Delete current folder button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete This Folder",
+                                     callback_data=f"delete_confirm:{file_session_id}:{current_hash}")
+            )
+
+        # Delete multiple items button (if there are items to delete)
+        if all_items and current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete Multiple",
+                                     callback_data=f"delete_multiple:{file_session_id}:{current_hash}")
+            )
+
+        if action_row_1:
+            keyboard.append(action_row_1)
+        if action_row_2:
+            keyboard.append(action_row_2)
+        if action_row_3:
+            keyboard.append(action_row_3)
+
+        return InlineKeyboardMarkup(keyboard)
+
+    @staticmethod
+    async def create_delete_confirmation_keyboard(file_session_id: str, item_hash: str, is_file: bool = False) -> InlineKeyboardMarkup:
+        """Create confirmation keyboard for delete operations"""
+        item_type = "file" if is_file else "folder"
+        keyboard = [
+            [
+                InlineKeyboardButton(f"✅ Yes, Delete {item_type}", callback_data=f"delete_yes:{file_session_id}:{item_hash}"),
+                InlineKeyboardButton("❌ Cancel", callback_data=f"delete_no:{file_session_id}:{item_hash}")
+            ]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+
+    async def create_browse_keyboard(self, current_path: str, import_session_id: str) -> InlineKeyboardMarkup:
+        """Create inline keyboard for browsing without file selection"""
+        items = await self.get_folder_structure(current_path)
+        keyboard = []
+
+        # Get pagination info from import session
+        import_session = self.import_sessions.get(import_session_id, {})
+        current_page = import_session.get('current_page', 1)
+        items_per_page = import_session.get('items_per_page', 10)
+
+        # Separate folders and files
+        folders = [item for item in items if item['is_directory']]
+        files = [item for item in items if not item['is_directory']]
+        all_items = folders + files
+
+        # Calculate pagination
+        total_items = len(all_items)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+
+        # Add pagination numbers at top (if more than 1 page)
+        if total_pages > 1:
+            page_buttons = []
+            if total_pages <= 10:
+                for page in range(1, total_pages + 1):
+                    button_text = f"• {page} •" if page == current_page else str(page)
+                    page_buttons.append(
+                        InlineKeyboardButton(button_text, callback_data=f"browse_page:{import_session_id}:{page}")
+                    )
+            else:
+                # Handle more than 10 pages (similar logic as before)
+                if current_page <= 8:
+                    for page in range(1, 9):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"browse_page:{import_session_id}:{page}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"browse_page:{import_session_id}:{total_pages}")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages),
+                                             callback_data=f"browse_page:{import_session_id}:{total_pages}")
+                    )
+                else:
+                    page_buttons.append(
+                        InlineKeyboardButton("1", callback_data=f"browse_page:{import_session_id}:1")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"browse_page:{import_session_id}:1")
+                    )
+                    for page in range(max(2, current_page - 1), min(total_pages, current_page + 2)):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"browse_page:{import_session_id}:{page}")
+                        )
+                    if current_page < total_pages - 1:
+                        page_buttons.append(
+                            InlineKeyboardButton("...", callback_data=f"browse_page:{import_session_id}:{total_pages}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages),
+                                             callback_data=f"browse_page:{import_session_id}:{total_pages}")
+                    )
+
+            # Add page buttons in rows of 5
+            for i in range(0, len(page_buttons), 5):
+                keyboard.append(page_buttons[i:i + 5])
+
+        # Get items for current page
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_items = all_items[start_idx:end_idx]
+
+        # Add item buttons (1 per row) with numbering
+        item_number = 1
+        for item in page_items:
+            if item['is_directory']:
+                path_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(f"{item_number}. 📁 {item['name']}",
+                                         callback_data=f"browse_nav:{import_session_id}:{path_hash}")
+                ])
+            else:
+                file_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{item_number}. 📄 {item['name']} ({self.format_file_size(item['size'])})",
+                        callback_data=f"browse_file_delete:{import_session_id}:{file_hash}"
+                    )
+                ])
+            item_number += 1
+
+        # Add action buttons
+        action_row_1 = []
+        action_row_2 = []
+        action_row_3 = []
+
+        # Back button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
+            if parent_path == '/webdav':
+                parent_path = f'/webdav/{ROOT_FOLDER_NAME}'
+            parent_hash = self.get_path_hash(parent_path)
+            action_row_1.append(
+                InlineKeyboardButton("⬅️ Back", callback_data=f"browse_nav:{import_session_id}:{parent_hash}")
+            )
+
+        # Import Files button - use hash
+        current_hash = self.get_path_hash(current_path)
+        action_row_1.append(
+            InlineKeyboardButton("📥 Import Files", callback_data=f"import_files:{import_session_id}:{current_hash}")
+        )
+
+        # Create new folder - use hash
+        action_row_2.append(
+            InlineKeyboardButton("➕ New Folder", callback_data=f"browse_newfolder:{import_session_id}:{current_hash}")
+        )
+
+        # Delete current folder button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete This Folder",
+                                     callback_data=f"browse_delete_confirm:{import_session_id}:{current_hash}")
+            )
+
+        # Delete multiple items button (if there are items to delete)
+        if all_items and current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete Multiple",
+                                     callback_data=f"browse_delete_multiple:{import_session_id}:{current_hash}")
+            )
+
+        if action_row_1:
+            keyboard.append(action_row_1)
+        if action_row_2:
+            keyboard.append(action_row_2)
+        if action_row_3:
+            keyboard.append(action_row_3)
+
+        return InlineKeyboardMarkup(keyboard)
+
+    async def handle_import_session_text(self, client, message: Message, import_session_id: str, import_session: dict):
+        """Handle text messages for import sessions (browse mode)"""
+        if import_session.get('waiting_for') == 'folder_name':
+            folder_name = message.text.strip()
+            target_path = import_session.get('target_path')
+
+            if not folder_name:
+                await message.reply("❌ Folder name cannot be empty. Please try again.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            # Create the new folder
+            new_folder_path = target_path.rstrip('/') + f'/{folder_name}/'
+
+            create_folder_message = await message.reply(
+                f"🔄 Creating folder `{folder_name}`...",
+                reply_to_message_id=message.reply_to_message.id
+            )
+
+            if await self.create_folder(new_folder_path):
+                await create_folder_message.delete()
+                import_session['current_path'] = new_folder_path
+                import_session['waiting_for'] = None
+                import_session['target_path'] = None
+                import_session['expecting_reply_to'] = None
+
+                keyboard = await self.create_browse_keyboard(new_folder_path, import_session_id)
+
+                try:
+                    await client.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=import_session.get('reply_message_id'),
+                        text=(
+                            f"📁 **Browse Mode**\n"
+                            f"🛣️ **Current Path:** `{unquote(new_folder_path)}`\n\n"
+                            f"**New Folder Created ✅**\n\n"
+                            "**Select folder to browse or import files:**"
+                        ),
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update browse message: {e}")
+
+            else:
+                await message.reply(
+                    "❌ Failed to create folder. Please try again.",
+                    reply_to_message_id=message.reply_to_message.id
+                )
+
+            await message.delete()
+            if 'prompt_message_id' in import_session:
+                try:
+                    await client.delete_messages(message.chat.id, import_session['prompt_message_id'])
+                    del import_session['prompt_message_id']
+                except Exception as e:
+                    logger.error(f"Failed to delete prompt message: {e}")
+
+        elif import_session.get('waiting_for') == 'delete_numbers':
+            numbers = self.parse_number_list(message.text)
+
+            if not numbers:
+                await message.reply("❌ No valid numbers found. Please send numbers like '1,2,3' or '1 2 3'.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            # Get current folder items
+            current_path = import_session['current_path']
+            items = await self.get_folder_structure(current_path)
+            folders = [item for item in items if item['is_directory']]
+            files = [item for item in items if not item['is_directory']]
+            all_items = folders + files
+
+            # Validate numbers
+            valid_numbers = [n for n in numbers if 1 <= n <= len(all_items)]
+            invalid_numbers = [n for n in numbers if n not in valid_numbers]
+
+            if invalid_numbers:
+                await message.reply(
+                    f"❌ Invalid numbers: {', '.join(map(str, invalid_numbers))}. "
+                    f"Valid range: 1-{len(all_items)}",
+                    reply_to_message_id=message.reply_to_message.id
+                )
+                return
+
+            # Get items to delete
+            items_to_delete = [all_items[n - 1] for n in valid_numbers]
+
+            # Store in session for confirmation
+            import_session['delete_multiple_items'] = items_to_delete
+            import_session['delete_multiple_numbers'] = valid_numbers
+            import_session['waiting_for'] = None
+            import_session['expecting_reply_to'] = None
+
+            # Create confirmation message
+            items_list = "\n".join([f"{n}. {'📁' if item['is_directory'] else '📄'} {item['name']}"
+                                    for n, item in zip(valid_numbers, items_to_delete)])
+
+            confirmation_keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("✅ Yes, Delete Selected",
+                                         callback_data=f"browse_delete_multiple_yes:{import_session_id}:{import_session.get('current_hash')}"),
+                    InlineKeyboardButton("❌ Cancel",
+                                         callback_data=f"browse_delete_multiple_no:{import_session_id}:{import_session.get('current_hash')}")
+                ]
+            ])
+
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=import_session.get('reply_message_id'),
+                    text=(
+                        f"🗑️ **Confirm Multiple Deletion**\n\n"
+                        f"You selected {len(valid_numbers)} items to delete:\n\n"
+                        f"{items_list}\n\n"
+                        "Are you sure you want to delete these items?"
+                    ),
+                    reply_markup=confirmation_keyboard
+                )
+            except Exception as e:
+                logger.error(f"Failed to update message: {e}")
+
+            await message.delete()
+            if 'prompt_message_id' in import_session:
+                try:
+                    await client.delete_messages(message.chat.id, import_session['prompt_message_id'])
+                    del import_session['prompt_message_id']
+                except Exception as e:
+                    logger.error(f"Failed to delete prompt message: {e}")
+
+    async def handle_import_session_file(self, client, message: Message, import_session_id: str, import_session: dict,
+                                         display_message=False):
+        """Handle file uploads during import session"""
+        file_info = self.extract_file_info(message)
+        if not file_info:
+            await message.reply("❌ Unsupported file type", reply_to_message_id=message.id)
+            return
+
+        # Add file to import session
+        import_session['files_to_import'].append({
+            'message': message,
+            'file_info': file_info
+        })
+
+        if display_message:
+            # Update the import session message to show collected files
+            files_list = "\n".join([f"• {file['file_info']['name']} ({self.format_file_size(file['file_info']['size'])})"
+                                    for file in import_session['files_to_import']])
+
+            try:
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=import_session.get('reply_message_id'),
+                    text=(
+                        f"📥 **Import Files Mode**\n"
+                        f"🛣️ **Target Path:** `{unquote(import_session['current_path'])}`\n\n"
+                        f"**Files Collected ({len(import_session['files_to_import'])}):**\n"
+                        f"{files_list}\n\n"
+                        "**Send more files or click Done to import:**"
+                    ),
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Done - Import Files",
+                                                 callback_data=f"import_done:{import_session_id}"),
+                            InlineKeyboardButton("❌ Cancel",
+                                                 callback_data=f"import_cancel:{import_session_id}")
+                        ]
+                    ])
+                )
+            except Exception as e:
+                logger.error(f"Failed to update import message: {e}")
+
+    async def handle_callback_query(self, client, callback_query: CallbackQuery):
+        """Handle inline keyboard callbacks with file session support"""
+        data = callback_query.data
+        user_id = callback_query.from_user.id
+
+        if data.startswith('import_done:') or data.startswith('import_cancel:'):
+            await self.handle_import_callback(client, callback_query, data)
+            return
+
+        # Parse the callback data format: action:session_id:path_hash
+        parts = data.split(':', 2)
+        if len(parts) < 3:
+            await callback_query.answer("Invalid callback data", show_alert=True)
+            return
+
+        action, session_id, path_hash = parts[0], parts[1], parts[2]
+
+        # Check if this is a browse session first
+        if session_id.startswith('browse_'):
+            # Handle import session
+            if session_id not in self.import_sessions:
+                await callback_query.answer("Browse session expired. Please use /browse again.", show_alert=True)
+                return
+
+            session = self.import_sessions[session_id]
+
+            # Verify user ownership
+            if session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            # Handle browse-specific actions
+
+            elif action == "browse_nav":
+                # Navigate in browse mode
+                folder_path = self.get_path_from_hash(path_hash)
+                if not folder_path:
+                    await callback_query.answer("Invalid navigation path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                if import_session_id not in self.import_sessions:
+                    await callback_query.answer("Session expired. Please use /browse again.", show_alert=True)
+                    return
+
+                import_session = self.import_sessions[import_session_id]
+                import_session['current_path'] = folder_path
+                new_keyboard = await self.create_browse_keyboard(folder_path, import_session_id)
+
+                await callback_query.edit_message_text(
+                    f"📁 **Browse Mode**\n"
+                    f"🛣️ **Current Path:** `{unquote(folder_path)}`\n\n"
+                    "**Select folder to browse or import files:**",
+                    reply_markup=new_keyboard
+                )
+
+                folder_name = unquote(folder_path.rstrip('/').split('/')[-1])
+                if not folder_name or folder_path == f'/webdav/{ROOT_FOLDER_NAME}':
+                    folder_name = 'Root' if not ROOT_FOLDER_NAME else ROOT_FOLDER_NAME
+                await callback_query.answer(f"📁 Browsing: {folder_name}")
+
+            elif action == "browse_page":
+                # Handle pagination in browse mode
+                try:
+                    page_num = int(path_hash)
+                    import_session_id = parts[1]
+                    if import_session_id not in self.import_sessions:
+                        await callback_query.answer("Session expired", show_alert=True)
+                        return
+
+                    import_session = self.import_sessions[import_session_id]
+                    import_session['current_page'] = page_num
+
+                    current_path = import_session['current_path']
+                    new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+
+                    await callback_query.edit_message_text(
+                        f"📁 **Browse Mode**\n"
+                        f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                        f"📄 **Page {page_num}**\n\n"
+                        "**Select folder to browse or import files:**",
+                        reply_markup=new_keyboard
+                    )
+                    await callback_query.answer(f"📄 Page {page_num}")
+                except ValueError:
+                    await callback_query.answer("Invalid page number", show_alert=True)
+
+            elif action == "import_files":
+                # Start import files mode
+                import_session_id = parts[1]
+                if import_session_id not in self.import_sessions:
+                    await callback_query.answer("Session expired", show_alert=True)
+                    return
+
+                import_session = self.import_sessions[import_session_id]
+                import_session['waiting_for_files'] = True
+                import_session['files_to_import'] = []
+
+                await callback_query.edit_message_text(
+                    f"📥 **Import Files Mode**\n"
+                    f"🛣️ **Target Path:** `{unquote(import_session['current_path'])}`\n\n"
+                    "**Send or forward files you want to import to this folder.**\n"
+                    "Files will be imported when you click 'Done'.\n\n"
+                    "**Send files now...**",
+                    reply_markup=InlineKeyboardMarkup([
+                        [
+                            InlineKeyboardButton("✅ Done - Import Files",
+                                                 callback_data=f"import_done:{import_session_id}"),
+                            InlineKeyboardButton("❌ Cancel",
+                                                 callback_data=f"import_cancel:{import_session_id}")
+                        ]
+                    ])
+                )
+                await callback_query.answer("📥 Import mode activated. Send files now!")
+
+            elif action == "browse_newfolder":
+                # Create new folder in browse mode
+                current_path = self.get_path_from_hash(path_hash)
+                if not current_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                import_session['waiting_for'] = 'folder_name'
+                import_session['target_path'] = current_path
+                import_session['expecting_reply_to'] = callback_query.message.id
+
+                prompt_msg = await callback_query.message.reply(
+                    "📝 **Create New Folder**\n\n"
+                    "Please send the name for the new folder **AS A REPLY TO THE 📁 Browse Mode MESSAGE**:",
+                    reply_to_message_id=import_session.get('reply_message_id')
+                )
+
+                import_session['prompt_message_id'] = prompt_msg.id
+                await callback_query.answer()
+
+            elif action == "browse_delete_confirm":
+                # Folder delete confirmation in browse mode
+                item_path = self.get_path_from_hash(path_hash)
+                if not item_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                import_session['delete_item'] = item_path
+                import_session['delete_hash'] = path_hash
+                import_session['is_file_delete'] = False
+
+                confirmation_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, Delete Folder",
+                                             callback_data=f"browse_delete_yes:{import_session_id}:{path_hash}"),
+                        InlineKeyboardButton("❌ Cancel",
+                                             callback_data=f"browse_delete_no:{import_session_id}:{path_hash}")
+                    ]
+                ])
+                await callback_query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
+                await callback_query.answer("Confirm folder deletion")
+
+            elif action == "browse_file_delete":
+                # File delete confirmation in browse mode
+                file_path = self.get_path_from_hash(path_hash)
+                if not file_path:
+                    await callback_query.answer("Invalid file path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                import_session['delete_item'] = file_path
+                import_session['delete_hash'] = path_hash
+                import_session['is_file_delete'] = True
+
+                confirmation_keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton("✅ Yes, Delete File",
+                                             callback_data=f"browse_delete_yes:{import_session_id}:{path_hash}"),
+                        InlineKeyboardButton("❌ Cancel",
+                                             callback_data=f"browse_delete_no:{import_session_id}:{path_hash}")
+                    ]
+                ])
+                await callback_query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
+                await callback_query.answer("Confirm file deletion")
+
+            elif action == "browse_delete_yes":
+                # Confirm deletion in browse mode
+                item_path = self.get_path_from_hash(path_hash)
+                if not item_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                is_file_delete = import_session.get('is_file_delete', False)
+
+                if is_file_delete:
+                    await callback_query.edit_message_text("🗑️ **Deleting file...**")
+                else:
+                    await callback_query.edit_message_text(
+                        "🗑️ **Deleting... This may take a while for large folders.**")
+
+                success = await self.delete_item(item_path)
+
+                if success:
+                    # Determine where to navigate after deletion
+                    if is_file_delete:
+                        current_path = import_session['current_path']
+                    else:
+                        current_path = '/'.join(item_path.rstrip('/').split('/')[:-1])
+                        if current_path == '/webdav':
+                            current_path = f'/webdav/{ROOT_FOLDER_NAME}'
+                        import_session['current_path'] = current_path
+
+                    new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+
+                    await callback_query.edit_message_text(
+                        f"📁 **Browse Mode**\n"
+                        f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                        f"✅ **{'File' if is_file_delete else 'Folder'} deleted successfully!**\n\n"
+                        "**Select folder to browse or import files:**",
+                        reply_markup=new_keyboard
+                    )
+                else:
+                    await callback_query.edit_message_text(
+                        f"❌ **Failed to delete {'file' if is_file_delete else 'folder'}.**")
+
+                # Clean up delete session
+                for key in ['delete_item', 'delete_hash', 'is_file_delete']:
+                    if key in import_session:
+                        del import_session[key]
+
+            elif action == "browse_delete_no":
+                # Cancel deletion in browse mode
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                current_path = import_session['current_path']
+
+                new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+                await callback_query.edit_message_text(
+                    f"📁 **Browse Mode**\n"
+                    f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                    "**Select folder to browse or import files:**",
+                    reply_markup=new_keyboard
+                )
+                await callback_query.answer("Deletion cancelled ✅")
+
+                # Clean up delete session
+                for key in ['delete_item', 'delete_hash', 'is_file_delete']:
+                    if key in import_session:
+                        del import_session[key]
+
+            elif action == "browse_delete_multiple":
+                # Start multiple deletion in browse mode
+                current_path = self.get_path_from_hash(path_hash)
+                if not current_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+
+                items = await self.get_folder_structure(current_path)
+                folders = [item for item in items if item['is_directory']]
+                files = [item for item in items if not item['is_directory']]
+                all_items = folders + files
+
+                if not all_items:
+                    await callback_query.answer("No items to delete in this folder", show_alert=True)
+                    return
+
+                import_session['waiting_for'] = 'delete_numbers'
+                import_session['expecting_reply_to'] = callback_query.message.id
+                import_session['current_hash'] = path_hash
+
+                items_list = "\n".join([f"{i + 1}. {'📁' if item['is_directory'] else '📄'} {item['name']}"
+                                        for i, item in enumerate(all_items)])
+
+                prompt_msg = await callback_query.message.reply(
+                    f"🗑️ **Delete Multiple Items**\n\n"
+                    f"Current folder items:\n{items_list}\n\n"
+                    f"Please send the numbers of items you want to delete **AS A REPLY TO THE 📁 Browse Mode MESSAGE**\n\n"
+                    f"Format: `1,2,3` or `1 2 3`\n"
+                    f"Example: `1,3,5` to delete items 1, 3, and 5",
+                    reply_to_message_id=import_session.get('reply_message_id')
+                )
+
+                import_session['prompt_message_id'] = prompt_msg.id
+                await callback_query.answer()
+
+            elif action == "browse_delete_multiple_yes":
+                # Confirm multiple deletion in browse mode
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                items_to_delete = import_session.get('delete_multiple_items', [])
+
+                if not items_to_delete:
+                    await callback_query.answer("No items to delete", show_alert=True)
+                    return
+
+                await callback_query.edit_message_text("🗑️ **Deleting multiple items... This may take a while.**")
+
+                delete_tasks = [self.delete_item(item['path']) for item in items_to_delete]
+                results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+                success_count = 0
+                failed_items = []
+
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        failed_items.append(items_to_delete[i]['name'])
+                        logger.error(f"Delete failed for {items_to_delete[i]['name']}: {result}")
+                    elif result is True:
+                        success_count += 1
+                    else:
+                        failed_items.append(items_to_delete[i]['name'])
+
+                current_path = import_session['current_path']
+                new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+
+                result_text = f"✅ **Multiple Deletion Complete**\n\n"
+                result_text += f"Successfully deleted: {success_count}/{len(items_to_delete)} items\n"
+
+                if failed_items:
+                    result_text += f"\n❌ Failed to delete:\n" + "\n".join([f"• {item}" for item in failed_items])
+
+                await callback_query.edit_message_text(
+                    f"📁 **Browse Mode**\n"
+                    f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                    f"{result_text}\n\n"
+                    "**Select folder to browse or import files:**",
+                    reply_markup=new_keyboard
+                )
+
+                # Clean up delete session
+                for key in ['delete_multiple_items', 'delete_multiple_numbers', 'current_hash']:
+                    if key in import_session:
+                        del import_session[key]
+
+            elif action == "browse_delete_multiple_no":
+                # Cancel multiple deletion in browse mode
+                import_session_id = parts[1]
+                import_session = self.import_sessions[import_session_id]
+                current_path = import_session['current_path']
+
+                new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+                await callback_query.edit_message_text(
+                    f"📁 **Browse Mode**\n"
+                    f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                    "**Select folder to browse or import files:**",
+                    reply_markup=new_keyboard
+                )
+                await callback_query.answer("Multiple deletion cancelled ✅")
+
+                # Clean up delete session
+                for key in ['delete_multiple_items', 'delete_multiple_numbers', 'current_hash']:
+                    if key in import_session:
+                        del import_session[key]
+            return
+
+        # Otherwise handle as file session
+        if session_id not in self.file_sessions:
+            await callback_query.answer("Session expired. Please send the file again.", show_alert=True)
+            return
+
+        file_session_id = session_id
+
+        file_session = self.file_sessions[file_session_id]
+
+        # Verify user ownership
+        if file_session['user_id'] != user_id:
+            await callback_query.answer("Unauthorized", show_alert=True)
+            return
+
+        if action == "nav":
+            # Navigate to folder
+            folder_path = self.get_path_from_hash(path_hash)
+            if not folder_path:
+                await callback_query.answer("Invalid navigation path", show_alert=True)
+                return
+
+            file_session['current_path'] = folder_path
+            new_keyboard = await self.create_folder_keyboard(folder_path, file_session_id)
+
+            # Update the message
+            file_info = file_session['file_info']
+            await callback_query.edit_message_text(
+                f"📁 **File received:** `{file_info['name']}`\n"
+                f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                f"🗂 **Type:** {file_info['type']}\n"
+                f"🛣️ **Current Path:** `{unquote(folder_path)}`\n\n"
+                "**Please select destination folder:**",
+                reply_markup=new_keyboard
+            )
+            folder_name = unquote(folder_path.rstrip('/').split('/')[-1])
+            if not folder_name or folder_path == f'/webdav/{ROOT_FOLDER_NAME}':
+                folder_name = 'Root' if not ROOT_FOLDER_NAME else ROOT_FOLDER_NAME
+            await callback_query.answer(f"📁 Browsing: {folder_name}")
+
+        elif action == "select":
+            selected_path = self.get_path_from_hash(path_hash)
+
+            if not selected_path:
+                await callback_query.answer("Invalid selection path", show_alert=True)
+                return
+
+            await self.process_file_storage(client, callback_query, selected_path, file_session_id)
+
+        elif action == "newfolder":
+            current_path = self.get_path_from_hash(path_hash)
+            if not current_path:
+                await callback_query.answer("Invalid path", show_alert=True)
+                return
+
+            file_session['waiting_for'] = 'folder_name'
+            file_session['target_path'] = current_path
+            file_session['expecting_reply_to'] = callback_query.message.id
+
+            prompt_msg = await callback_query.message.reply(
+                "📝 **Create New Folder**\n\n"
+                "Please send the name for the new folder **AS A REPLY TO THE 📁 File received:... MESSAGE**:",
+                reply_to_message_id=file_session.get('reply_message_id')
+            )
+
+            file_session['prompt_message_id'] = prompt_msg.id
+
+            await callback_query.answer()
+
+        elif action == "folderfromname":
+            current_path = self.get_path_from_hash(path_hash)
+
+            if not current_path:
+                await callback_query.answer("Invalid path", show_alert=True)
+                return
+            file_info = file_session['file_info']
+            # Extract folder name from filename (remove extension)
+            folder_name = os.path.splitext(file_info['name'])[0]
+            new_folder_path = current_path.rstrip('/') + f'/{folder_name}/'
+
+            if await self.create_folder(new_folder_path):
+                await self.process_file_storage(client, callback_query, new_folder_path, file_session_id)
+            else:
+                await callback_query.answer("❌ Failed to create folder", show_alert=True)
+
+        elif action == "delete_confirm":
+            # Folder delete confirmation
+            item_path = self.get_path_from_hash(path_hash)
+            if not item_path:
+                await callback_query.answer("Invalid path", show_alert=True)
+                return
+
+            # Store the item to delete in session
+            file_session['delete_item'] = item_path
+            file_session['delete_hash'] = path_hash
+            file_session['is_file_delete'] = False
+
+            confirmation_keyboard = await self.create_delete_confirmation_keyboard(file_session_id, path_hash, is_file=False)
+            await callback_query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
+            await callback_query.answer("Confirm folder deletion")
+
+        elif action == "file_delete_confirm":
+            # File delete confirmation
+            file_path = self.get_path_from_hash(path_hash)
+            if not file_path:
+                await callback_query.answer("Invalid file path", show_alert=True)
+                return
+
+            # Store the file to delete in session
+            file_session['delete_item'] = file_path
+            file_session['delete_hash'] = path_hash
+            file_session['is_file_delete'] = True
+
+            confirmation_keyboard = await self.create_delete_confirmation_keyboard(file_session_id, path_hash, is_file=True)
+            await callback_query.edit_message_reply_markup(reply_markup=confirmation_keyboard)
+            await callback_query.answer("Confirm file deletion")
+
+        elif action == "delete_yes":
+            # Confirm deletion (handles both files and folders)
+            item_path = self.get_path_from_hash(path_hash)
+            if not item_path:
+                await callback_query.answer("Invalid path", show_alert=True)
+                return
+
+            is_file_delete = file_session.get('is_file_delete', False)
+
+            if is_file_delete:
+                await callback_query.edit_message_text("🗑️ **Deleting file...**")
+            else:
+                await callback_query.edit_message_text("🗑️ **Deleting... This may take a while for large folders.**")
+
+            success = await self.delete_item(item_path)
+
+            if success:
+                # Determine where to navigate after deletion
+                if is_file_delete:
+                    # For file deletion, stay in the current directory
+                    current_path = file_session['current_path']
+                else:
+                    # For folder deletion, navigate to parent directory
+                    current_path = '/'.join(item_path.rstrip('/').split('/')[:-1])
+                    if current_path == '/webdav':
+                        current_path = f'/webdav/{ROOT_FOLDER_NAME}'
+                    # Update session with new current path
+                    file_session['current_path'] = current_path
+
+                # Refresh the keyboard
+                new_keyboard = await self.create_folder_keyboard(current_path, file_session_id)
+
+                file_info = file_session['file_info']
+                await callback_query.edit_message_text(
+                    f"📁 **File received:** `{file_info['name']}`\n"
+                    f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                    f"🗂 **Type:** {file_info['type']}\n"
+                    f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                    f"✅ **{'File' if is_file_delete else 'Folder'} deleted successfully!**\n\n"
+                    "**Please select destination folder:**",
+                    reply_markup=new_keyboard
+                )
+            else:
+                await callback_query.edit_message_text(f"❌ **Failed to delete {'file' if is_file_delete else 'folder'}.**")
+
+            # Clean up delete session
+            for key in ['delete_item', 'delete_hash', 'is_file_delete']:
+                if key in file_session:
+                    del file_session[key]
+
+        elif action == "delete_no":
+            # Cancel deletion - go back to normal view
+            current_path = file_session['current_path']
+
+            # Restore normal keyboard
+            new_keyboard = await self.create_folder_keyboard(current_path, file_session_id)
+            file_info = file_session['file_info']
+            await callback_query.edit_message_text(
+                f"📁 **File received:** `{file_info['name']}`\n"
+                f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                f"🗂 **Type:** {file_info['type']}\n"
+                f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                "**Please select destination folder:**",
+                reply_markup=new_keyboard
+            )
+            await callback_query.answer("Deletion cancelled ✅")
+
+            # Clean up delete session
+            for key in ['delete_item', 'delete_hash', 'is_file_delete']:
+                if key in file_session:
+                    del file_session[key]
+
+        elif action == "delete_multiple":
+            current_path = self.get_path_from_hash(path_hash)
+            if not current_path:
+                await callback_query.answer("Invalid path", show_alert=True)
+                return
+
+            # Get current folder items for numbering reference
+            items = await self.get_folder_structure(current_path)
+            folders = [item for item in items if item['is_directory']]
+            files = [item for item in items if not item['is_directory']]
+            all_items = folders + files
+
+            if not all_items:
+                await callback_query.answer("No items to delete in this folder", show_alert=True)
+                return
+
+            file_session['waiting_for'] = 'delete_numbers'
+            file_session['expecting_reply_to'] = callback_query.message.id
+            file_session['current_hash'] = path_hash
+
+            # Create numbered list for user reference
+            items_list = "\n".join([f"{i + 1}. {'📁' if item['is_directory'] else '📄'} {item['name']}"
+                                    for i, item in enumerate(all_items)])
+
+            prompt_msg = await callback_query.message.reply(
+                f"🗑️ **Delete Multiple Items**\n\n"
+                f"Current folder items:\n{items_list}\n\n"
+                f"Please send the numbers of items you want to delete **AS A REPLY TO THE 📁 File received:... MESSAGE**\n\n"
+                f"Format: `1,2,3` or `1 2 3`\n"
+                f"Example: `1,3,5` to delete items 1, 3, and 5",
+                reply_to_message_id=file_session.get('reply_message_id')
+            )
+
+            file_session['prompt_message_id'] = prompt_msg.id
+            await callback_query.answer()
+
+        elif action == "delete_multiple_yes":
+            # Confirm multiple deletion
+            items_to_delete = file_session.get('delete_multiple_items', [])
+
+            if not items_to_delete:
+                await callback_query.answer("No items to delete", show_alert=True)
+                return
+
+            await callback_query.edit_message_text("🗑️ **Deleting multiple items... This may take a while.**")
+
+            success_count = 0
+            failed_items = []
+
+            # Delete items concurrently
+            delete_tasks = [self.delete_item(item['path']) for item in items_to_delete]
+            results = await asyncio.gather(*delete_tasks, return_exceptions=True)
+
+            success_count = 0
+            failed_items = []
+
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    failed_items.append(items_to_delete[i]['name'])
+                    logger.error(f"Delete failed for {items_to_delete[i]['name']}: {result}")
+                elif result is True:
+                    success_count += 1
+                else:
+                    failed_items.append(items_to_delete[i]['name'])
+
+            # Navigate back to current folder and refresh
+            current_path = file_session['current_path']
+            new_keyboard = await self.create_folder_keyboard(current_path, file_session_id)
+
+            # Create result message
+            result_text = f"✅ **Multiple Deletion Complete**\n\n"
+            result_text += f"Successfully deleted: {success_count}/{len(items_to_delete)} items\n"
+
+            if failed_items:
+                result_text += f"\n❌ Failed to delete:\n" + "\n".join([f"• {item}" for item in failed_items])
+
+            file_info = file_session['file_info']
+            await callback_query.edit_message_text(
+                f"📁 **File received:** `{file_info['name']}`\n"
+                f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                f"🗂 **Type:** {file_info['type']}\n"
+                f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                f"{result_text}\n\n"
+                "**Please select destination folder:**",
+                reply_markup=new_keyboard
+            )
+
+            # Clean up delete session
+            for key in ['delete_multiple_items', 'delete_multiple_numbers', 'current_hash']:
+                if key in file_session:
+                    del file_session[key]
+
+        elif action == "delete_multiple_no":
+            # Cancel multiple deletion - go back to normal view
+            current_path = file_session['current_path']
+
+            # Restore normal keyboard
+            new_keyboard = await self.create_folder_keyboard(current_path, file_session_id)
+            file_info = file_session['file_info']
+            await callback_query.edit_message_text(
+                f"📁 **File received:** `{file_info['name']}`\n"
+                f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                f"🗂 **Type:** {file_info['type']}\n"
+                f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                "**Please select destination folder:**",
+                reply_markup=new_keyboard
+            )
+            await callback_query.answer("Multiple deletion cancelled ✅")
+
+            # Clean up delete session
+            for key in ['delete_multiple_items', 'delete_multiple_numbers', 'current_hash']:
+                if key in file_session:
+                    del file_session[key]
+
+        elif action == "page":
+            # Handle pagination
+            try:
+                page_num = int(path_hash)
+                file_session['current_page'] = page_num
+
+                current_path = file_session['current_path']
+                new_keyboard = await self.create_folder_keyboard(current_path, file_session_id)
+
+                file_info = file_session['file_info']
+                await callback_query.edit_message_text(
+                    f"📁 **File received:** `{file_info['name']}`\n"
+                    f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                    f"🗂 **Type:** {file_info['type']}\n"
+                    f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                    f"📄 **Page {page_num}**\n\n"
+                    "**Please select destination folder:**",
+                    reply_markup=new_keyboard
+                )
+                await callback_query.answer(f"📄 Page {page_num}")
+            except ValueError:
+                await callback_query.answer("Invalid page number", show_alert=True)
+
+        else:
+            await callback_query.answer("Unknown action", show_alert=True)
+
+    async def handle_import_callback(self, client, callback_query: CallbackQuery, data: str):
+        """Handle import-specific callbacks (import_done, import_cancel)"""
+        user_id = callback_query.from_user.id
+
+        if data.startswith('import_done:'):
+            # Handle import completion
+            import_session_id = data.split(':', 1)[1]
+
+            if import_session_id not in self.import_sessions:
+                await callback_query.answer("Import session expired", show_alert=True)
+                return
+
+            import_session = self.import_sessions[import_session_id]
+
+            # Verify user ownership
+            if import_session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            files_to_import = import_session.get('files_to_import', [])
+
+            if not files_to_import:
+                await callback_query.answer("No files to import", show_alert=True)
+                return
+
+            await callback_query.edit_message_text(
+                f"📤 **Importing {len(files_to_import)} files...**\n\n"
+                "This may take a while. Please wait..."
+            )
+
+            success_count = 0
+            failed_files = []
+
+            for file_data in files_to_import:
+                original_message = file_data['message']
+                file_info = file_data['file_info']
+
+                try:
+                    # Upload to storage channel
+                    if self.enable_upload_records:
+                        await client.send_message(
+                            chat_id=self.storage_channel_id,
+                            text=f"File: {file_info['name']}\nFrom: @{callback_query.from_user.username or callback_query.from_user.first_name}\nTarget: {import_session['current_path']}"
+                        )
+
+                    # Send file to storage channel based on type
+                    if original_message.video:
+                        storage_msg = await client.send_video(
+                            chat_id=self.storage_channel_id,
+                            video=file_info['file_id'],
+                            caption=f"🎥 {file_info['name']}"
+                        )
+                        await original_message.delete()
+                    elif original_message.document:
+                        storage_msg = await client.send_document(
+                            chat_id=self.storage_channel_id,
+                            document=file_info['file_id'],
+                            caption=f"📄 {file_info['name']}"
+                        )
+                        await original_message.delete()
+                    elif original_message.audio:
+                        storage_msg = await client.send_audio(
+                            chat_id=self.storage_channel_id,
+                            audio=file_info['file_id'],
+                            caption=f"🎵 {file_info['name']}"
+                        )
+                        await original_message.delete()
+                    elif original_message.voice:
+                        storage_msg = await client.send_voice(
+                            chat_id=self.storage_channel_id,
+                            voice=file_info['file_id'],
+                            caption=f"🗣 {file_info['name']}"
+                        )
+                        await original_message.delete()
+                    elif original_message.video_note:
+                        storage_msg = await client.send_video_note(
+                            chat_id=self.storage_channel_id,
+                            video_note=file_info['file_id']
+                        )
+                        await original_message.delete()
+                    else:
+                        continue
+
+                    # Import file using TGFS API
+                    success = await self.import_file(
+                        directory=import_session['current_path'],
+                        filename=file_info['name'],
+                        channel_id=self.storage_channel_id,
+                        message_id=storage_msg.id
+                    )
+
+                    if success:
+                        success_count += 1
+                    else:
+                        failed_files.append(file_info['name'])
+
+                except Exception as e:
+                    logger.error(f"Error importing file {file_info['name']}: {e}")
+                    failed_files.append(file_info['name'])
+
+            # Show results
+            result_text = f"📥 **Import Complete**\n\n"
+            result_text += f"✅ Successfully imported: {success_count}/{len(files_to_import)} files\n"
+
+            if failed_files:
+                result_text += f"\n❌ Failed to import:\n" + "\n".join([f"• {file}" for file in failed_files])
+
+            # Return to browse mode
+            current_path = import_session['current_path']
+            new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+
+            await callback_query.edit_message_text(
+                f"📁 **Browse Mode**\n"
+                f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                f"{result_text}\n\n"
+                "**Select folder to browse or import files:**",
+                reply_markup=new_keyboard
+            )
+
+            # Clean up import session
+            import_session['waiting_for_files'] = False
+            import_session['files_to_import'] = []
+
+        elif data.startswith('import_cancel:'):
+            # Handle import cancellation
+            import_session_id = data.split(':', 1)[1]
+
+            if import_session_id not in self.import_sessions:
+                await callback_query.answer("Import session expired", show_alert=True)
+                return
+
+            import_session = self.import_sessions[import_session_id]
+
+            # Verify user ownership
+            if import_session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            # Return to browse mode
+            current_path = import_session['current_path']
+            new_keyboard = await self.create_browse_keyboard(current_path, import_session_id)
+
+            await callback_query.edit_message_text(
+                f"📁 **Browse Mode**\n"
+                f"🛣️ **Current Path:** `{unquote(current_path)}`\n\n"
+                "**Select folder to browse or import files:**",
+                reply_markup=new_keyboard
+            )
+
+            # Clean up import session
+            import_session['waiting_for_files'] = False
+            import_session['files_to_import'] = []
+            await callback_query.answer("Import cancelled")
+
+    async def process_file_storage(self, client, callback_query: CallbackQuery, target_path: str, file_session_id: str):
+        """Process the file storage after path selection"""
+        file_session = self.file_sessions[file_session_id]
+        original_message = file_session['original_message']
+        file_info = file_session['file_info']
+        user_id = file_session['user_id']
+
+        # Send file to storage channel first
+        await callback_query.edit_message_text(
+            "📤 **Uploading file to storage channel...**"
+        )
+
+        try:
+            # Forward/send file to storage channel
+            if self.enable_upload_records:
+                await client.send_message(
+                    chat_id=self.storage_channel_id,
+                    text=f"File: {file_info['name']}\nFrom: @{callback_query.from_user.username or callback_query.from_user.first_name}\nTarget: {target_path}"
+                )
+
+            # Copy the media to storage channel
+            if original_message.video:
+                storage_msg = await client.send_video(
+                    chat_id=self.storage_channel_id,
+                    video=file_info['file_id'],
+                    caption=f"🎥 {file_info['name']}"
+                )
+            elif original_message.document:
+                storage_msg = await client.send_document(
+                    chat_id=self.storage_channel_id,
+                    document=file_info['file_id'],
+                    caption=f"📄 {file_info['name']}"
+                )
+            elif original_message.audio:
+                storage_msg = await client.send_audio(
+                    chat_id=self.storage_channel_id,
+                    audio=file_info['file_id'],
+                    caption=f"🎵 {file_info['name']}"
+                )
+            elif original_message.voice:
+                storage_msg = await client.send_voice(
+                    chat_id=self.storage_channel_id,
+                    voice=file_info['file_id'],
+                    caption=f"🗣 {file_info['name']}"
+                )
+            elif original_message.video_note:
+                storage_msg = await client.send_video_note(
+                    chat_id=self.storage_channel_id,
+                    video_note=file_info['file_id']
+                )
+            else:
+                await callback_query.edit_message_text(
+                    "w❌ **Invalid, Unsupported or Unknown File Type**"
+                )
+                return
+
+            # Get the message ID of the sent file
+            storage_message_id = storage_msg.id
+
+            # Update status
+            await callback_query.edit_message_text(
+                "📁 **Creating folder structure and importing file...**"
+            )
+
+            # Import file using TGFS API
+            success = await self.import_file(
+                directory=target_path,
+                filename=file_info['name'],
+                channel_id=self.storage_channel_id,
+                message_id=storage_message_id
+            )
+
+            if success:
+                await callback_query.edit_message_text(
+                    f"✅ **File Successfully Stored!**\n\n"
+                    f"📁 **Location:** `{unquote(target_path)}`\n"
+                    f"📄 **File:** `{file_info['name']}`\n"
+                    f"📏 **Size:** {self.format_file_size(file_info['size'])}\n"
+                    f"🕐 **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            else:
+                await callback_query.edit_message_text(
+                    f"⚠️ **File uploaded but import failed**\n\n"
+                    f"The file has been uploaded to the storage channel but couldn't be imported to TGFS.\n"
+                    f"Message ID: {storage_message_id}\n"
+                    f"Please check the TGFS configuration."
+                )
+
+            if file_session_id in self.file_sessions:
+                del self.file_sessions[file_session_id]
+
+            # Also remove from user session
+            if user_id in self.user_sessions and 'file_sessions' in self.user_sessions[user_id]:
+                self.user_sessions[user_id]['file_sessions'] = [
+                    fsid for fsid in self.user_sessions[user_id]['file_sessions']
+                    if fsid != file_session_id
+                ]
+
+        except Exception as e:
+            logger.error(f"Error processing file storage: {e}")
+            await callback_query.edit_message_text(
+                f"❌ **Error occurred during file storage:**\n\n"
+                f"`{str(e)}`\n\n"
+                "Please try again."
+            )
+        finally:
+            # Clean up session
+            if user_id in self.user_sessions:
+                del self.user_sessions[user_id]
+
+    async def cleanup_old_sessions(self):
+        """Clean up old file and import sessions periodically"""
+        while True:
+            await asyncio.sleep(3600)  # Clean up every hour
+            current_time = time.time()
+            expired_file_sessions = []
+            expired_import_sessions = []
+
+            # Clean up file sessions
+            for file_session_id, session in list(self.file_sessions.items()):
+                if current_time - session.get('created_time', 0) > 86400:
+                    expired_file_sessions.append(file_session_id)
+
+            # Clean up import sessions
+            for import_session_id, session in list(self.import_sessions.items()):
+                if current_time - session.get('created_time', 0) > 86400:
+                    expired_import_sessions.append(import_session_id)
+
+            for session_id in expired_file_sessions:
+                del self.file_sessions[session_id]
+
+            for session_id in expired_import_sessions:
+                del self.import_sessions[session_id]
+
+            if expired_file_sessions or expired_import_sessions:
+                logger.info(
+                    f"Cleaned up {len(expired_file_sessions)} expired file sessions and {len(expired_import_sessions)} expired import sessions")
+
+    async def run(self):
+        """Start the bot"""
+        cleanup_task = None
+        try:
+            # Authenticate with TGFS API
+            logger.info("Authenticating with TGFS API...")
+            if not await self.authenticate():
+                logger.error("Failed to authenticate with TGFS API")
+                return
+            logger.info("TGFS authentication successful")
+
+            self.app = Client(
+                "tgfs_bot",
+                api_id=self.api_id,
+                api_hash=self.api_hash,
+                bot_token=self.bot_token,
+                in_memory=True
+            )
+
+            logger.info("Registering handlers...")
+            self.register_handlers()
+
+            logger.info("Starting TGFS Bot...")
+            await self.app.start()
+
+            result = await self.app.set_bot_commands([
+                BotCommand("start", "Start the bot"),
+                BotCommand("browse", "Browse the TGFS Server, Import Multiple Files, Manage Files and Folders")
+            ])
+            if result:
+                logger.info('Bot Commands Set Successfully')
+
+            me = await self.app.get_me()
+            logger.info(f"Bot started successfully as @{me.username}")
+            logger.info(f"Bot ID: {me.id}")
+            logger.info(f"Bot name: {me.first_name}")
+
+            cleanup_task = asyncio.create_task(self.cleanup_old_sessions())
+
+            logger.info("Bot is now running and listening for messages...")
+
+            # Create a stop event for graceful shutdown
+            stop_event = asyncio.Event()
+
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                logger.info("Bot received shutdown signal")
+
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user (KeyboardInterrupt)")
+        except Exception as e:
+            logger.error(f"Failed to start bot: {e}")
+            raise
+        finally:
+            if cleanup_task:
+                cleanup_task.cancel()
+            if self.app and hasattr(self.app, 'is_connected') and self.app.is_connected:
+                logger.info("Stopping bot...")
+                await self.app.stop()
+                logger.info("Bot stopped successfully")
+
+if __name__ == "__main__":
+    # Load environment variables from .env file
+    try:
+        load_dotenv('settings.env')
+    except ImportError:
+        logger.warning("python-dotenv not installed. Make sure environment variables are set.")
+
+    bot = TGFSBot()
+    asyncio.run(bot.run())
