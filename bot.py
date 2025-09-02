@@ -11,6 +11,8 @@ from dotenv import load_dotenv
 
 import aiohttp
 from pyrogram import Client, filters
+from pyrogram.enums import ParseMode
+from pyrogram.errors import FloodWait
 from pyrogram.types import (
     Message, CallbackQuery, InlineKeyboardButton,
     InlineKeyboardMarkup, BotCommand
@@ -35,12 +37,18 @@ class TGFSBot:
         self.bot_token = os.getenv('BOT_TOKEN')
         self.api_id = int(os.getenv('API_ID', '0'))
         self.api_hash = os.getenv('API_HASH', '')
-        self.allowed_user_id = int(os.getenv('ALLOWED_USER_ID', '0'))
+        self.allowed_user_ids = [
+            int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
+        ]
         self.storage_channel_id = int(os.getenv('STORAGE_CHANNEL_ID', '0'))
         self.enable_upload_records = os.getenv('ENABLE_UPLOAD_RECORDS', 'False').lower() in ['true', '1', 't']
+        self.items_per_page = int(os.getenv('ITEMS_PER_PAGE', '10'))
+        self.small_flood_wait = int(os.getenv('SMALL_FLOOD_WAIT', '10'))
+        self.big_flood_wait = int(os.getenv('BIG_FLOOD_WAIT', '320'))
         self.path_cache: Dict[str, str] = {}
         self.reverse_path_cache: Dict[str, str] = {}
         self.import_sessions: Dict[str, dict] = {}
+        self.index_sessions: Dict[str, dict] = {}
         self.cache_counter = 0
 
         # TGFS API settings
@@ -68,9 +76,17 @@ class TGFSBot:
         @self.app.on_message(filters.private)
         async def handle_private_message(client, message: Message):
             # Check if user is authorized
-            if message.from_user.id != self.allowed_user_id:
+            if message.from_user.id not in self.allowed_user_ids:
                 await message.reply("Unauthorized", reply_to_message_id=message.id)
                 return
+
+            if message.forward_from_chat:
+                user_id = message.from_user.id
+                for index_session_id, index_session in list(self.index_sessions.items()):
+                    if (index_session['user_id'] == user_id and
+                            index_session.get('step') == 'waiting_forward'):
+                        await self.handle_index_forward_message(client, message, index_session_id, index_session)
+                        return
 
             items = list(self.import_sessions.items())
             display_msg = False
@@ -98,7 +114,7 @@ class TGFSBot:
 
         @self.app.on_callback_query()
         async def handle_callback(client, callback_query: CallbackQuery):
-            if callback_query.from_user.id != self.allowed_user_id:
+            if callback_query.from_user.id not in self.allowed_user_ids:
                 await callback_query.answer("Unauthorized", show_alert=True)
                 return
 
@@ -330,14 +346,31 @@ class TGFSBot:
                 "Send me any file (photo, video, document, audio) and I'll help you organize it in your TGFS storage!\n\n"
                 "Commands:\n"
                 "• Send a file - Start file organization\n"
-                "• /browse - Browse folder structure"
+                "• /browse - Browse folder structure\n"
+                "• /indexchannel - Index/Import files from a channel to TGFS Server"
             )
         elif message.text == '/browse':
             await self.handle_browse_command(client, message)
+        elif message.text == '/indexchannel':
+            await self.handle_index_channel_command(client, message)
 
     async def handle_text_message(self, client, message: Message):
         """Handle text messages for folder creation with file session support"""
         user_id = message.from_user.id
+
+        for index_session_id, index_session in list(self.index_sessions.items()):
+            if (index_session['user_id'] == user_id and
+                    index_session.get('step') == 'waiting_forward' and
+                    message.forward_from_chat):
+                await self.handle_index_forward_message(client, message, index_session_id, index_session)
+                return
+
+
+        for index_session_id, index_session in list(self.index_sessions.items()):
+            if (index_session['user_id'] == user_id and
+                    index_session.get('expecting_reply_to') == message.reply_to_message.id):
+                await self.handle_index_session_text(client, message, index_session_id, index_session)
+                return
 
         # Check if this is a reply to one of our file messages
         if not message.reply_to_message:
@@ -461,7 +494,7 @@ class TGFSBot:
             'current_path': current_path,
             'created_time': time.time(),
             'current_page': 1,
-            'items_per_page': 10,
+            'items_per_page': self.items_per_page,
             'files_to_import': [],  # Store files for batch import
             'waiting_for_files': False,
             'original_message_id': message.id
@@ -478,6 +511,600 @@ class TGFSBot:
 
         # Store the reply message ID for later updates
         self.import_sessions[import_session_id]['reply_message_id'] = reply_msg.id
+
+    async def handle_index_channel_command(self, client, message: Message):
+        """Handle /indexchannel command"""
+        user_id = message.from_user.id
+
+        # Generate a unique index session ID
+        index_session_id = f"index_{user_id}_{message.id}"
+
+        # Store index session
+        self.index_sessions[index_session_id] = {
+            'user_id': user_id,
+            'created_time': time.time(),
+            'step': 'waiting_channel_id',
+            'original_message_id': message.id
+        }
+
+        reply_msg = await message.reply(
+            "📺 **Channel Indexing**\n\n"
+            "Please send the channel ID (e.g., `-100123456789`).\n\n"
+            "⚠️ **Important:**\n"
+            "• The ID should be from a **CHANNEL** (not a group)\n"
+            "• Add this bot as an **admin** to that channel\n"
+            "• The bot needs permission to read messages",
+            reply_to_message_id=message.id
+        )
+
+        self.index_sessions[index_session_id]['reply_message_id'] = reply_msg.id
+        self.index_sessions[index_session_id]['expecting_reply_to'] = reply_msg.id
+
+    async def handle_index_session_text(self, client, message: Message, index_session_id: str, index_session: dict):
+        """Handle text input for channel indexing"""
+        if index_session.get('step') == 'waiting_channel_id':
+            # Parse channel ID
+            try:
+                channel_id = int(message.text.strip())
+                if channel_id >= 0:
+                    await message.reply("❌ Channel ID must be negative (e.g., -100123456789)",
+                                        reply_to_message_id=message.reply_to_message.id)
+                    return
+            except ValueError:
+                await message.reply("❌ Invalid channel ID. Please send a valid number.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            # Test channel access
+            await client.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=index_session['reply_message_id'],
+                text="🔍 **Testing channel access...**"
+            )
+
+            try:
+                # Try to send a test message
+                await client.send_message(
+                    chat_id=channel_id,
+                    text="Configure Message From TGFS Manager Bot, You can delete this message"
+                )
+
+                # Store channel info
+                index_session['channel_id'] = channel_id
+                index_session['step'] = 'waiting_forward'
+
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=index_session['reply_message_id'],
+                    text=(
+                        "✅ **Channel Access Confirmed**\n\n"
+                        f"📺 **Channel ID:** `{channel_id}`\n\n"
+                        "**Now forward a message from this channel to set the ending point for indexing.**\n"
+                        "All messages from message ID 1 up to your forwarded message will be indexed.\n\n"
+                        "**⚠️ IMPORTANT!\nThis forwarded message must be originally sent by a channel admin. "
+                        "Do not forward a file that was already forwarded from another source.\n\n**"
+                        "💁‍♂️ Tip: If you cannot find a message that originated from the target channel, simply send a new text message "
+                        "to the channel and forward it to this bot."
+                    )
+                )
+
+            except Exception as e:
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=index_session['reply_message_id'],
+                    text=(
+                        "❌ **Cannot access channel**\n\n"
+                        "Please ensure:\n"
+                        "• The channel ID is correct\n"
+                        "• This bot is added as admin to the channel\n"
+                        "• The channel is actually a channel (not a group)\n\n"
+                        f"Error: `{str(e)}`"
+                    )
+                )
+
+            await message.delete()
+
+        elif index_session.get('waiting_for') == 'folder_name' and index_session.get('step') == 'select_path':
+            # Parse folder name for index session
+            folder_name = message.text.strip()
+            target_path = index_session.get('target_path')
+
+            if not folder_name:
+                await message.reply("Folder name cannot be empty. Please try again.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            # Create the new folder
+            new_folder_path = target_path.rstrip('/') + f'/{folder_name}/'
+
+            create_folder_message = await message.reply(
+                f"Creating folder `{folder_name}`...",
+                reply_to_message_id=message.reply_to_message.id
+            )
+
+            if await self.create_folder(new_folder_path):
+                await create_folder_message.delete()
+                index_session['current_path'] = new_folder_path
+                index_session['waiting_for'] = None
+                index_session['target_path'] = None
+                index_session['expecting_reply_to'] = None
+
+                keyboard = await self.create_index_path_keyboard(new_folder_path, index_session_id)
+
+                try:
+                    await client.edit_message_text(
+                        chat_id=message.chat.id,
+                        message_id=index_session.get('reply_message_id'),
+                        text=(
+                            f"**Endpoint Set**\n\n"
+                            f"**Channel:** `{index_session['channel_id']}`\n"
+                            f"**End Message ID:** `{index_session['end_message_id']}`\n\n"
+                            f"**New Folder Created**\n\n"
+                            f"**Select target folder for indexing:**"
+                        ),
+                        reply_markup=keyboard
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update index message: {e}")
+
+            else:
+                await message.reply(
+                    "Failed to create folder. Please try again.",
+                    reply_to_message_id=message.reply_to_message.id
+                )
+
+            await message.delete()
+            if 'prompt_message_id' in index_session:
+                try:
+                    await client.delete_messages(message.chat.id, index_session['prompt_message_id'])
+                    del index_session['prompt_message_id']
+                except Exception as e:
+                    logger.error(f"Failed to delete prompt message: {e}")
+
+        elif index_session.get('step') == 'waiting_skip_number':
+            # Parse skip number
+            try:
+                skip_number = int(message.text.strip())
+                if skip_number < 0:
+                    await message.reply("❌ Skip number must be 0 or positive",
+                                        reply_to_message_id=message.reply_to_message.id)
+                    return
+            except ValueError:
+                await message.reply("❌ Invalid skip number. Please send a valid number.",
+                                    reply_to_message_id=message.reply_to_message.id)
+                return
+
+            index_session['skip_number'] = skip_number
+            index_session['step'] = 'ready_to_index'
+
+            # Calculate actual range
+            start_id = skip_number + 1
+            end_id = index_session['end_message_id']
+            total_messages = end_id - start_id + 1
+
+            if total_messages <= 0:
+                await client.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id=index_session['reply_message_id'],
+                    text="❌ **Invalid range**: Skip number is too high. No messages to index."
+                )
+                await message.delete()
+                return
+
+            # Show final confirmation
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🚀 Start Indexing", callback_data=f"start_indexing:{index_session_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_indexing:{index_session_id}")
+                ]
+            ])
+
+            await client.edit_message_text(
+                chat_id=message.chat.id,
+                message_id=index_session['reply_message_id'],
+                text=(
+                    f"📋 **Indexing Summary**\n\n"
+                    f"📺 **Channel:** `{index_session['channel_id']}`\n"
+                    f"📁 **Target Path:** `{unquote(index_session['target_path'])}`\n"
+                    f"📊 **Range:** Messages {start_id} to {end_id}\n"
+                    f"📈 **Total Messages:** {total_messages}\n"
+                    f"⏭️ **Skip First:** {skip_number} messages\n\n"
+                    "Ready to start indexing?"
+                ),
+                reply_markup=keyboard
+            )
+
+            await message.delete()
+            if 'prompt_msg' in index_session:
+                await index_session['prompt_msg'].delete()
+
+    async def handle_index_forward_message(self, client, message: Message, index_session_id: str, index_session: dict):
+        """Handle forwarded message for indexing endpoint"""
+        if not message.forward_from_chat:
+            await message.reply("❌ Please forward a message from the target channel.",
+                                reply_to_message_id=message.reply_to_message.id)
+            return
+
+        forwarded_channel_id = message.forward_from_chat.id
+        expected_channel_id = index_session.get('channel_id')
+
+        if forwarded_channel_id != expected_channel_id:
+            await message.reply(
+                f"❌ Forwarded message is from wrong channel.\n"
+                f"Expected: `{expected_channel_id}`\n"
+                f"Got: `{forwarded_channel_id}`",
+                reply_to_message_id=message.reply_to_message.id
+            )
+            return
+
+        end_message_id = message.forward_from_message_id
+        index_session['end_message_id'] = end_message_id
+        index_session['step'] = 'select_path'
+
+        # Show path selection
+        current_path = f'/webdav/{ROOT_FOLDER_NAME}'
+        index_session['current_path'] = current_path
+
+        keyboard = await self.create_index_path_keyboard(current_path, index_session_id)
+
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=index_session['reply_message_id'],
+            text=(
+                f"✅ **Endpoint Set**\n\n"
+                f"📺 **Channel:** `{expected_channel_id}`\n"
+                f"🔚 **End Message ID:** `{end_message_id}`\n\n"
+                f"📁 **Select target folder for indexing:**"
+            ),
+            reply_markup=keyboard
+        )
+
+        await message.delete()
+
+    async def create_index_path_keyboard(self, current_path: str, index_session_id: str) -> InlineKeyboardMarkup:
+        """Create keyboard for path selection during indexing setup"""
+        items = await self.get_folder_structure(current_path)
+        keyboard = []
+
+        # Add folder navigation (only folders, no files)
+        folders = [item for item in items if item['is_directory']]
+
+        for folder in folders:
+            path_hash = self.get_path_hash(folder['path'])
+            keyboard.append([
+                InlineKeyboardButton(f"📁 {folder['name']}", callback_data=f"index_nav:{index_session_id}:{path_hash}")
+            ])
+
+        # Action buttons
+        action_row_1 = []
+        action_row_2 = []
+
+        # Back button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
+            if parent_path == '/webdav':
+                parent_path = f'/webdav/{ROOT_FOLDER_NAME}'
+            parent_hash = self.get_path_hash(parent_path)
+            action_row_1.append(
+                InlineKeyboardButton("⬅️ Back", callback_data=f"index_nav:{index_session_id}:{parent_hash}")
+            )
+
+        # Select current path
+        current_hash = self.get_path_hash(current_path)
+        action_row_1.append(
+            InlineKeyboardButton("✅ Select This Path",
+                                 callback_data=f"index_select_path:{index_session_id}:{current_hash}")
+        )
+
+        # Create new folder
+        action_row_2.append(
+            InlineKeyboardButton("➕ New Folder", callback_data=f"index_newfolder:{index_session_id}:{current_hash}")
+        )
+
+        if action_row_1:
+            keyboard.append(action_row_1)
+        if action_row_2:
+            keyboard.append(action_row_2)
+
+        return InlineKeyboardMarkup(keyboard)
+
+    async def start_channel_indexing(self, client, index_session_id: str):
+        """Start the actual channel indexing process"""
+        index_session = self.index_sessions[index_session_id]
+
+        end_message_id = index_session['end_message_id']
+        skip_number = index_session['skip_number']
+
+        start_id = skip_number + 1
+        total_messages = end_message_id - start_id + 1
+
+        index_session['current_message_id'] = start_id
+        index_session['total_messages'] = total_messages
+        index_session['processed_count'] = 0
+        index_session['success_count'] = 0
+        index_session['failed_count'] = 0
+        index_session['is_running'] = True
+        index_session['start_time'] = time.time()
+
+        # Start the indexing task
+        indexing_task = asyncio.create_task(
+            self.process_channel_indexing(client, index_session_id)
+        )
+        index_session['indexing_task'] = indexing_task
+
+        # Start the progress monitoring task
+        progress_task = asyncio.create_task(
+            self.monitor_indexing_progress(client, index_session_id)
+        )
+        index_session['progress_task'] = progress_task
+
+    async def process_channel_indexing(self, client, index_session_id: str):
+        """Process channel indexing message by message with flood wait handling"""
+        index_session = self.index_sessions[index_session_id]
+
+        channel_id = index_session['channel_id']
+        end_message_id = index_session['end_message_id']
+        target_path = index_session['target_path']
+        current_message_id = index_session['current_message_id']
+
+        try:
+            while current_message_id <= end_message_id and index_session.get('is_running'):
+                try:
+                    # Clear any flood wait status
+                    index_session['flood_wait_until'] = None
+                    index_session['flood_wait_reason'] = None
+
+                    # Get message with flood wait handling
+                    msg = await self._get_message_with_flood_wait(client, channel_id, current_message_id, index_session)
+
+                    if not index_session.get('is_running'):  # Check if stopped during flood wait
+                        break
+
+                    if msg and not msg.empty:
+                        # Check if message has media
+                        file_info = self.extract_file_info(msg)
+
+                        if file_info:
+                            try:
+                                # Send to storage channel (also with flood wait handling)
+                                storage_msg = await self._send_to_storage_with_flood_wait(
+                                    client, msg, file_info, channel_id, index_session
+                                )
+
+                                if not index_session.get('is_running'):  # Check if stopped during flood wait
+                                    break
+
+                                if storage_msg:
+                                    # Import to TGFS
+                                    success = await self.import_file(
+                                        directory=target_path,
+                                        filename=file_info['name'],
+                                        channel_id=self.storage_channel_id,
+                                        message_id=storage_msg.id
+                                    )
+
+                                    if success:
+                                        index_session['success_count'] += 1
+                                    else:
+                                        index_session['failed_count'] += 1
+                                else:
+                                    index_session['failed_count'] += 1
+
+                            except Exception as e:
+                                logger.error(f"Error processing message {current_message_id}: {e}")
+                                index_session['failed_count'] += 1
+
+                    index_session['processed_count'] += 1
+
+                except Exception as e:
+                    logger.error(f"Error getting message {current_message_id}: {e}")
+                    index_session['failed_count'] += 1
+
+                current_message_id += 1
+                index_session['current_message_id'] = current_message_id
+
+                # Small delay to avoid rate limits (but not during flood wait)
+                if not index_session.get('flood_wait_until'):
+                    await asyncio.sleep(self.small_flood_wait)
+
+            # Mark as completed
+            index_session['is_running'] = False
+            index_session['completed'] = True
+
+        except Exception as e:
+            logger.error(f"Channel indexing error: {e}")
+            index_session['is_running'] = False
+            index_session['error'] = str(e)
+
+    async def _get_message_with_flood_wait(self, client, channel_id: int, message_id: int, index_session: dict):
+        """Get message with flood wait handling"""
+        max_retries = 3
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                return await client.get_messages(channel_id, message_id)
+            except FloodWait as e:
+                wait_time = e.value
+                cooldown_time = self.big_flood_wait
+                total_wait = wait_time + cooldown_time
+
+                logger.info(f"FloodWait: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
+
+                # Store flood wait info for progress display
+                index_session['flood_wait_until'] = time.time() + total_wait
+                index_session['flood_wait_reason'] = f"get_messages (message {message_id})"
+
+                await asyncio.sleep(total_wait)
+                retry_count += 1
+
+            except Exception as e:
+                logger.error(f"Error getting message {message_id}: {e}")
+                if retry_count < max_retries - 1:
+                    await asyncio.sleep(2)
+                    retry_count += 1
+                else:
+                    raise
+
+        return None
+
+    async def _send_to_storage_with_flood_wait(self, client, msg, file_info: dict, source_channel_id: int,
+                                               index_session: dict):
+        """Send file to storage channel with flood wait handling"""
+        max_retries = 3
+        retry_count = 0
+
+        while retry_count < max_retries:
+            try:
+                # Send based on media type
+                if msg.video:
+                    return await client.send_video(
+                        chat_id=self.storage_channel_id,
+                        video=file_info['file_id'],
+                        caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
+                    )
+                elif msg.document:
+                    return await client.send_document(
+                        chat_id=self.storage_channel_id,
+                        document=file_info['file_id'],
+                        caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
+                    )
+                elif msg.audio:
+                    return await client.send_audio(
+                        chat_id=self.storage_channel_id,
+                        audio=file_info['file_id'],
+                        caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
+                    )
+                elif msg.voice:
+                    return await client.send_voice(
+                        chat_id=self.storage_channel_id,
+                        voice=file_info['file_id'],
+                        caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
+                    )
+                elif msg.video_note:
+                    return await client.send_video_note(
+                        chat_id=self.storage_channel_id,
+                        video_note=file_info['file_id']
+                    )
+
+            except FloodWait as e:
+                wait_time = e.value
+                cooldown_time = self.big_flood_wait
+                total_wait = wait_time + cooldown_time
+
+                logger.info(f"FloodWait on send: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
+
+                # Store flood wait info for progress display
+                index_session['flood_wait_until'] = time.time() + total_wait
+                index_session['flood_wait_reason'] = f"send_to_storage ({file_info['name']})"
+
+                await asyncio.sleep(total_wait)
+                retry_count += 1
+
+            except Exception as e:
+                logger.error(f"Error sending file {file_info['name']}: {e}")
+                if retry_count < max_retries - 1:
+                    await asyncio.sleep(2)
+                    retry_count += 1
+                else:
+                    raise
+
+        return None
+
+    async def monitor_indexing_progress(self, client, index_session_id: str):
+        """Monitor and update indexing progress every 5 seconds with flood wait display"""
+        index_session = self.index_sessions[index_session_id]
+
+        while index_session.get('is_running'):
+            try:
+                await asyncio.sleep(5)
+
+                if not index_session.get('is_running'):
+                    break
+
+                # Calculate progress
+                processed = index_session.get('processed_count', 0)
+                total = index_session.get('total_messages', 1)
+                success = index_session.get('success_count', 0)
+                failed = index_session.get('failed_count', 0)
+                current_id = index_session.get('current_message_id', 0)
+
+                progress_percent = (processed / total) * 100
+                elapsed_time = time.time() - index_session.get('start_time', time.time())
+
+                # Check for flood wait status
+                flood_wait_until = index_session.get('flood_wait_until')
+                flood_wait_reason = index_session.get('flood_wait_reason', '')
+
+                status_line = ""
+                if flood_wait_until and time.time() < flood_wait_until:
+                    remaining_wait = int(flood_wait_until - time.time())
+                    status_line = f"⏳ **FLOOD WAIT:** {remaining_wait}s remaining\n📝 **Reason:** {flood_wait_reason}\n\n"
+                    eta_text = f"Paused (flood wait)"
+                else:
+                    # Estimate time remaining
+                    if processed > 0:
+                        time_per_message = elapsed_time / processed
+                        remaining_messages = total - processed
+                        eta_seconds = time_per_message * remaining_messages
+                        eta_text = f"{int(eta_seconds // 60)}m {int(eta_seconds % 60)}s"
+                    else:
+                        eta_text = "Calculating..."
+
+                # Create progress bar
+                bar_length = 20
+                filled_length = int(bar_length * processed // total)
+                bar = "█" * filled_length + "░" * (bar_length - filled_length)
+
+                # Stop button
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("⏹️ Stop Indexing", callback_data=f"stop_indexing:{index_session_id}")]
+                ])
+
+                progress_text = (
+                    f"📊 **Channel Indexing Progress**\n\n"
+                    f"📺 **Channel:** `{index_session['channel_id']}`\n"
+                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"{status_line}"
+                    f"🔄 **Progress:** {progress_percent:.1f}%\n"
+                    f"`{bar}` {processed}/{total}\n\n"
+                    f"📨 **Current Message ID:** {current_id}\n"
+                    f"✅ **Success:** {success}\n"
+                    f"⚠️ **Unsupported/Text Messages:** {max(0, processed - (success + failed))}\n"
+                    f"❌ **Failed:** {failed}\n"
+                    f"⏱️ **Elapsed:** {int(elapsed_time // 60)}m {int(elapsed_time % 60)}s\n"
+                    f"🕐 **ETA:** {eta_text}"
+                )
+
+                await client.edit_message_text(
+                    chat_id=index_session['user_id'],
+                    message_id=index_session['reply_message_id'],
+                    text=progress_text,
+                    reply_markup=keyboard
+                )
+
+            except Exception as e:
+                logger.error(f"Error updating progress: {e}")
+
+        # Final update when completed
+        if index_session.get('completed'):
+            total_time = time.time() - index_session.get('start_time', time.time())
+            await client.edit_message_text(
+                chat_id=index_session['user_id'],
+                message_id=index_session['reply_message_id'],
+                text=(
+                    f"🎉 **Channel Indexing Complete!**\n\n"
+                    f"📺 **Channel:** `{index_session['channel_id']}`\n"
+                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"📊 **Results:**\n"
+                    f"✅ **Success:** {index_session.get('success_count', 0)}\n"
+                    f"⚠️ **Unsupported/Text Messages:** {max(0, index_session.get('total_messages', 0) - 
+                                                             (index_session.get('success_count', 0) + index_session.get('failed_count', 0)))}\n"
+                    f"❌ **Failed:** {index_session.get('failed_count', 0)}\n"
+                    f"📈 **Total Processed:** {index_session.get('processed_count', 0)}\n"
+                    f"⏱️ **Total Time:** {int(total_time // 60)}m {int(total_time % 60)}s"
+                )
+            )
 
     async def handle_delete_multiple_input(self, client, message: Message, file_session_id: str, file_session: dict):
         """Handle user input for delete multiple numbers"""
@@ -581,7 +1208,7 @@ class TGFSBot:
             'target_path': None,
             'expecting_reply_to': None,
             'current_page': 1,
-            'items_per_page': 10
+            'items_per_page': self.items_per_page
         }
 
         # Store in user session for easy access
@@ -1139,6 +1766,49 @@ class TGFSBot:
             await self.handle_import_callback(client, callback_query, data)
             return
 
+        if data.startswith('start_indexing:') or data.startswith('stop_indexing:') or data.startswith(
+                'cancel_indexing:'):
+            parts = data.split(':', 1)
+            if len(parts) != 2:
+                await callback_query.answer("Invalid callback data", show_alert=True)
+                return
+
+            action, session_id = parts[0], parts[1]
+
+            # Handle index session callbacks
+            if session_id not in self.index_sessions:
+                await callback_query.answer("Index session expired. Please use /indexchannel again.", show_alert=True)
+                return
+
+            session = self.index_sessions[session_id]
+            if session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            if action == "start_indexing":
+                await self.start_channel_indexing(client, session_id)
+                await callback_query.answer("Indexing started!")
+            elif action == "stop_indexing":
+                session['is_running'] = False
+                if 'indexing_task' in session:
+                    session['indexing_task'].cancel()
+                if 'progress_task' in session:
+                    session['progress_task'].cancel()
+
+                await callback_query.edit_message_text(
+                    f"**Indexing Stopped**\n\n"
+                    f"**Progress:** {session.get('processed_count', 0)}/{session.get('total_messages', 0)}\n"
+                    f"**Success:** {session.get('success_count', 0)}\n"
+                    f"**Unsupported/Text Messages:** {max(0, session.get('processed_count', 0) - (session.get('success_count', 0) + session.get('failed_count', 0)))}\n"
+                    f"**Failed:** {session.get('failed_count', 0)}"
+                )
+                await callback_query.answer("Indexing stopped")
+            elif action == "cancel_indexing":
+                await callback_query.edit_message_text("**Channel indexing cancelled**")
+                await callback_query.answer("Cancelled")
+
+            return
+
         # Parse the callback data format: action:session_id:path_hash
         parts = data.split(':', 2)
         if len(parts) < 3:
@@ -1488,6 +2158,82 @@ class TGFSBot:
                 for key in ['delete_multiple_items', 'delete_multiple_numbers', 'current_hash']:
                     if key in import_session:
                         del import_session[key]
+            return
+
+        # Check if this is an index session
+        if session_id.startswith('index_'):
+            if session_id not in self.index_sessions:
+                await callback_query.answer("Index session expired. Please use /indexchannel again.", show_alert=True)
+                return
+
+            session = self.index_sessions[session_id]
+
+            if session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            # Handle index-specific actions
+            if action == "index_nav":
+                # Navigate in index path selection
+                folder_path = self.get_path_from_hash(path_hash)
+                if not folder_path:
+                    await callback_query.answer("Invalid navigation path", show_alert=True)
+                    return
+
+                session['current_path'] = folder_path
+                new_keyboard = await self.create_index_path_keyboard(folder_path, session_id)
+
+                await callback_query.edit_message_text(
+                    f"📁 **Select target folder for indexing:**\n"
+                    f"🛣️ **Current Path:** `{unquote(folder_path)}`",
+                    reply_markup=new_keyboard
+                )
+
+            elif action == "index_select_path":
+                # Path selected, ask for skip number
+                selected_path = self.get_path_from_hash(path_hash)
+                if not selected_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                session['target_path'] = selected_path
+                session['step'] = 'waiting_skip_number'
+                session['expecting_reply_to'] = callback_query.message.id
+
+                prompt_msg = await callback_query.message.reply(
+                    f"⏭️ **Set Skip Number**\n\n"
+                    f"📁 **Target Path:** `{unquote(selected_path)}`\n"
+                    f"🔚 **End Message ID:** `{session['end_message_id']}`\n\n"
+                    f"**Send the number of messages to skip from the beginning.**\n"
+                    f"(Send `0` to start from message ID 1)\n\n"
+                    f"**REPLY TO 'Select target' MESSAGE WITH A VALID NUMBER:**",
+                    reply_to_message_id=session['reply_message_id']
+                )
+
+                session['prompt_message_id'] = prompt_msg.id
+                session['prompt_msg'] = prompt_msg
+                await callback_query.answer()
+
+            elif action == "index_newfolder":
+                # Create new folder in index path selection
+                current_path = self.get_path_from_hash(path_hash)
+                if not current_path:
+                    await callback_query.answer("Invalid path", show_alert=True)
+                    return
+
+                session['waiting_for'] = 'folder_name'
+                session['target_path'] = current_path
+                session['expecting_reply_to'] = callback_query.message.id
+
+                prompt_msg = await callback_query.message.reply(
+                    "**Create New Folder**\n\n"
+                    "Please send the name for the new folder **AS A REPLY TO THE Select target folder MESSAGE**:",
+                    reply_to_message_id=session.get('reply_message_id')
+                )
+
+                session['prompt_message_id'] = prompt_msg.id
+                await callback_query.answer()
+
             return
 
         # Otherwise handle as file session
@@ -2089,6 +2835,7 @@ class TGFSBot:
             current_time = time.time()
             expired_file_sessions = []
             expired_import_sessions = []
+            expired_index_sessions = []
 
             # Clean up file sessions
             for file_session_id, session in list(self.file_sessions.items()):
@@ -2100,15 +2847,49 @@ class TGFSBot:
                 if current_time - session.get('created_time', 0) > 86400:
                     expired_import_sessions.append(import_session_id)
 
+            # Clean up index sessions
+            for index_session_id, session in list(self.index_sessions.items()):
+                session_age = current_time - session.get('created_time', 0)
+                is_running = session.get('is_running', False)
+
+                # Only clean up sessions that are:
+                # 1. Very old (24+ hours) AND not currently running
+                # 2. OR sessions that failed/completed and are old (6+ hours)
+                should_cleanup = False
+
+                if session_age > 86400 and not is_running:  # 24 hours, not running
+                    should_cleanup = True
+                elif session_age > 21600 and (session.get('completed') or session.get('error')):  # 6 hours, finished
+                    should_cleanup = True
+
+                if should_cleanup:
+                    expired_index_sessions.append(index_session_id)
+
             for session_id in expired_file_sessions:
                 del self.file_sessions[session_id]
 
             for session_id in expired_import_sessions:
                 del self.import_sessions[session_id]
 
-            if expired_file_sessions or expired_import_sessions:
+            for session_id in expired_index_sessions:
+                # Only cancel tasks if the session is truly abandoned
+                session = self.index_sessions[session_id]
+
+                # Cancel tasks only if they exist and the session isn't actively running
+                if not session.get('is_running'):
+                    if 'indexing_task' in session:
+                        session['indexing_task'].cancel()
+                    if 'progress_task' in session:
+                        session['progress_task'].cancel()
+
+                del self.index_sessions[session_id]
+
+            if expired_file_sessions or expired_import_sessions or expired_index_sessions:
                 logger.info(
-                    f"Cleaned up {len(expired_file_sessions)} expired file sessions and {len(expired_import_sessions)} expired import sessions")
+                    f"Cleaned up {len(expired_file_sessions)} expired file sessions, "
+                    f"{len(expired_import_sessions)} expired import sessions, and "
+                    f"{len(expired_index_sessions)} expired index sessions"
+                )
 
     async def run(self):
         """Start the bot"""
@@ -2137,7 +2918,8 @@ class TGFSBot:
 
             result = await self.app.set_bot_commands([
                 BotCommand("start", "Start the bot"),
-                BotCommand("browse", "Browse the TGFS Server, Import Multiple Files, Manage Files and Folders")
+                BotCommand("browse", "Browse the TGFS Server, Import Multiple Files, Manage Files and Folders"),
+                BotCommand("indexchannel", "Index files from a channel")
             ])
             if result:
                 logger.info('Bot Commands Set Successfully')
