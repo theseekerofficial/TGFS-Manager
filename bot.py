@@ -2150,6 +2150,7 @@ class TGFSBot:
             cleanup_task = asyncio.create_task(self.cleanup_old_sessions())
 
             logger.info("Bot is now running and listening for messages...")
+            logger.info("👨‍💻 TGFS Manger => Created by The Seeker")
 
             # Create a stop event for graceful shutdown
             stop_event = asyncio.Event()
