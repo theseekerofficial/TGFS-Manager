@@ -5,22 +5,22 @@ An unofficial TGFS Manager Bot for [TGFS](https://github.com/TheodoreKrypton/tgf
 ## Screenshots
 
 ### Start Command
-<img src="https://i.ibb.co/Sb39fKg/image-2025-09-03-132636924.png" alt="Start Command" width="400">
+<img src="https://i.imgur.com/OTEwzRx.png" alt="Start Command" width="400">
 
 ### File Upload/Forward
-<img src="https://i.ibb.co/mV6YWVT2/image-2025-09-03-133615185.png" alt="File Upload or Forward" width="400">
+<img src="https://i.imgur.com/9lM29vd.png" alt="File Upload or Forward" width="400">
 
 ### Browse Command
-<img src="https://i.ibb.co/B59z01fn/image-2025-09-03-133049039.png" alt="Browse Command - File List" width="400">
-<img src="https://i.ibb.co/k26qDZWr/image-2025-09-03-133231261.png" alt="Browse Command - Options" width="400">
+<img src="https://i.imgur.com/LlNL5jf.png" alt="Browse Command - File List" width="400">
+<img src="https://i.imgur.com/K1dtgBe.png" alt="Browse Command - Options" width="400">
 
 ### Index Channel Command
-<img src="https://i.ibb.co/zWTtSGdM/image-2025-09-03-133717820.png" alt="Index Channel - Start" width="400">
-<img src="https://i.ibb.co/TxK3gpNk/image-2025-09-03-133829956.png" alt="Index Channel - Processing" width="400">
-<img src="https://i.ibb.co/Kx8jbsxd/image-2025-09-03-133953505.png" alt="Index Channel - Progress" width="400">
-<img src="https://i.ibb.co/DPLdT1VF/image-2025-09-03-134056366.png" alt="Index Channel - Status" width="400">
-<img src="https://i.ibb.co/LLSP48q/image-2025-09-03-134136866.png" alt="Index Channel - Complete" width="400">
-<img src="https://i.ibb.co/MkY1vs5s/image-2025-09-03-134305283.png" alt="Index Channel - Final" width="400">
+<img src="https://i.imgur.com/BX334BW.png" alt="Index Channel - Start" width="400">
+<img src="https://i.imgur.com/MYXhFPA.png" alt="Index Channel - Processing" width="400">
+<img src="https://i.imgur.com/iqWz56C.png" alt="Index Channel - Progress" width="400">
+<img src="https://i.imgur.com/EKbLHye.png" alt="Index Channel - Status" width="400">
+<img src="https://i.imgur.com/lnvmuIs.png" alt="Index Channel - Complete" width="400">
+<img src="https://i.imgur.com/cksjS6H.png" alt="Index Channel - Final" width="400">
 
 ## Deployment Instructions
 
