@@ -20,6 +20,7 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 ROOT_FOLDER_NAME = os.getenv('TGFS_ROOT_CHANNEL_NAME', '') if os.getenv('TGFS_ROOT_CHANNEL_NAME', '') != '/' else ''
@@ -764,9 +765,20 @@ class TGFSBot:
                     logger.error(f"Failed to delete prompt message: {e}")
 
         elif index_session.get('step') == 'waiting_skip_number':
-            # Parse skip number
+            # Parse skip number and check for folder creation flag
+            text = message.text.strip()
+
+            # Check if user wants to create folders from filenames
+            create_folders_flag = False
+            skip_text = text
+
+            if text.lower().startswith('folders ') or ' folders' in text.lower():
+                create_folders_flag = True
+                # Extract the skip number part
+                skip_text = text.replace('folders', '').replace('FOLDERS', '').strip()
+
             try:
-                skip_number = int(message.text.strip())
+                skip_number = int(skip_text)
                 if skip_number < 0:
                     await message.reply("❌ Skip number must be 0 or positive",
                                         reply_to_message_id=message.reply_to_message.id)
@@ -777,6 +789,7 @@ class TGFSBot:
                 return
 
             index_session['skip_number'] = skip_number
+            index_session['create_folders'] = create_folders_flag
             index_session['step'] = 'ready_to_index'
 
             # Calculate actual range
@@ -793,7 +806,8 @@ class TGFSBot:
                 await message.delete()
                 return
 
-            # Show final confirmation
+            folder_info = "✅ **Create folders from filenames**\n" if create_folders_flag else "📁 **Import to parent folder**\n"
+
             keyboard = InlineKeyboardMarkup([
                 [
                     InlineKeyboardButton("🚀 Start Indexing", callback_data=f"start_indexing:{index_session_id}"),
@@ -808,6 +822,7 @@ class TGFSBot:
                     f"📋 **Indexing Summary**\n\n"
                     f"📺 **Channel:** `{index_session['channel_id']}`\n"
                     f"📁 **Target Path:** `{unquote(index_session['target_path'])}`\n"
+                    f"{folder_info}"
                     f"📊 **Range:** Messages {start_id} to {end_id}\n"
                     f"📈 **Total Messages:** {total_messages}\n"
                     f"⏭️ **Skip First:** {skip_number} messages\n\n"
@@ -1044,6 +1059,21 @@ class TGFSBot:
                 file_info = self.extract_file_info(msg)
 
                 if file_info:
+                    # Determine final target path based on folder creation setting
+                    final_target_path = target_path
+                    create_folders = index_session.get('create_folders', False)
+
+                    if create_folders:
+                        # Create folder from filename
+                        folder_name = os.path.splitext(file_info['name'])[0]
+                        folder_path = target_path.rstrip('/') + f'/{folder_name}/'
+
+                        # Create the folder if it doesn't exist
+                        if not await self.create_folder(folder_path):
+                            logger.error(f"Failed to create folder: {folder_path}")
+                        else:
+                            final_target_path = folder_path
+
                     # Send to storage channel with flood wait handling
                     storage_msg = await self._send_to_storage_with_flood_wait(
                         bot_client, msg, file_info, channel_id, index_session
@@ -1055,7 +1085,7 @@ class TGFSBot:
                     if storage_msg:
                         # Import to TGFS
                         success = await self.import_file(
-                            directory=target_path,
+                            directory=final_target_path,
                             filename=file_info['name'],
                             channel_id=self.storage_channel_id,
                             message_id=storage_msg.id
@@ -1183,6 +1213,8 @@ class TGFSBot:
                 failed = index_session.get('failed_count', 0)
                 current_id = index_session.get('current_message_id', 0)
 
+                folder_mode = "✅ Folders from filenames" if index_session.get('create_folders') else "📁 Parent folder"
+
                 progress_percent = (processed / total) * 100
                 elapsed_time = time.time() - index_session.get('start_time', time.time())
 
@@ -1221,7 +1253,8 @@ class TGFSBot:
                 progress_text = (
                     f"📊 **Channel Indexing Progress**\n\n"
                     f"📺 **Channel:** `{index_session['channel_id']}`\n"
-                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n"
+                    f"📂 **Mode:** {folder_mode}\n\n"
                     f"{bot_info}"
                     f"{status_line}"
                     f"🔄 **Progress:** {progress_percent:.1f}%\n"
@@ -1247,13 +1280,15 @@ class TGFSBot:
         # Final update when completed
         if index_session.get('completed'):
             total_time = time.time() - index_session.get('start_time', time.time())
+            folder_mode = "with folders from filenames" if index_session.get('create_folders') else "to parent folder"
             await client.edit_message_text(
                 chat_id=index_session['user_id'],
                 message_id=index_session['reply_message_id'],
                 text=(
                     f"🎉 **Channel Indexing Complete!**\n\n"
                     f"📺 **Channel:** `{index_session['channel_id']}`\n"
-                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"📁 **Target:** `{unquote(index_session['target_path'])}`\n"
+                    f"📂 **Mode:** {folder_mode}\n\n"
                     f"🤖 **Bots Used:** {len(self.multi_index_bot_holder) + 1}\n\n"
                     f"📊 **Results:**\n"
                     f"✅ **Success:** {index_session.get('success_count', 0)}\n"
@@ -1959,12 +1994,14 @@ class TGFSBot:
                     session['indexing_task'].cancel()
                 if 'progress_task' in session:
                     session['progress_task'].cancel()
+                folder_mode = "with folders from filenames" if session.get('create_folders') else "to parent folder"
 
                 await callback_query.edit_message_text(
                     f"**Indexing Stopped**\n\n"
                     f"**Progress:** {session.get('processed_count', 0)}/{session.get('total_messages', 0)}\n"
                     f"**Success:** {session.get('success_count', 0)}\n"
                     f"**Unsupported/Text Messages:** {max(0, session.get('processed_count', 0) - (session.get('success_count', 0) + session.get('failed_count', 0)))}\n"
+                    f"**Mode:** Imported {folder_mode}\n"
                     f"**Failed:** {session.get('failed_count', 0)}"
                 )
                 await callback_query.answer("Indexing stopped")
@@ -2370,12 +2407,16 @@ class TGFSBot:
                 session['expecting_reply_to'] = callback_query.message.id
 
                 prompt_msg = await callback_query.message.reply(
-                    f"⏭️ **Set Skip Number**\n\n"
+                    f"⏭️ **Set Skip Number & Folder Options**\n\n"
                     f"📁 **Target Path:** `{unquote(selected_path)}`\n"
                     f"🔚 **End Message ID:** `{session['end_message_id']}`\n\n"
                     f"**Send the number of messages to skip from the beginning.**\n"
                     f"(Send `0` to start from message ID 1)\n\n"
-                    f"**REPLY TO 'Select target' MESSAGE WITH A VALID NUMBER:**",
+                    f"📂 **To create folders from filenames, add 'folders' to your message:**\n"
+                    f"• `0` - Skip Number Only = Import to parent folder\n"
+                    f"• `0 folders` - Skip Number with 'folders' = Create folders from filenames\n"
+                    f"• `10 folders` - Skip 10 messages + create folders\n\n"
+                    f"**REPLY TO 'Select target' MESSAGE WITH VALID VALUE(S):**",
                     reply_to_message_id=session['reply_message_id']
                 )
 
@@ -3127,6 +3168,7 @@ class TGFSBot:
                     api_id=self.api_id,
                     api_hash=self.api_hash,
                     bot_token=bot_token,
+                    no_updates=True,
                     in_memory=True
                 )
 
