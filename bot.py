@@ -36,6 +36,10 @@ class TGFSBot:
         self.allowed_user_ids = [
             int(uid.strip()) for uid in os.getenv("ALLOWED_USER_IDS", "").split(",") if uid.strip()
         ]
+        self.multi_index_bots = [
+            token.strip() for token in os.getenv("INDEX_BOT_TOKENS", "").split(",") if token.strip()
+        ]
+        self.multi_index_bot_holder: Dict[str, Client] = {}
         self.storage_channel_id = int(os.getenv('STORAGE_CHANNEL_ID', '0'))
         self.enable_upload_records = os.getenv('ENABLE_UPLOAD_RECORDS', 'False').lower() in ['true', '1', 't']
         self.items_per_page = int(os.getenv('ITEMS_PER_PAGE', '10'))
@@ -44,6 +48,7 @@ class TGFSBot:
         self.path_cache: Dict[str, str] = {}
         self.reverse_path_cache: Dict[str, str] = {}
         self.cache_counter = 0
+        self._bot_round_robin_index = 0
 
         # TGFS API settings
         self.tgfs_base_url = os.getenv('TGFS_BASE_URL', 'https://tg-webdav.mlwa.xyz')
@@ -393,17 +398,24 @@ class TGFSBot:
             }
 
             async with aiohttp.ClientSession() as session:
-                async with session.post(
-                        f"{self.tgfs_base_url}/api/import",
-                        json=import_data,
-                        headers=headers
-                ) as response:
-                    if response.status == 200:
-                        return True
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Import failed: {response.status} - {error_text}")
-                        return False
+                # Try up to 2 times (initial + 1 retry)
+                for attempt in range(2):
+                    async with session.post(
+                            f"{self.tgfs_base_url}/api/import",
+                            json=import_data,
+                            headers=headers
+                    ) as response:
+                        if response.status == 200:
+                            return True
+                        else:
+                            error_text = await response.text()
+                            logger.error(
+                                f"Import failed: {response.status} - {error_text}. Retrying one more time before giving up this file")
+                            # If this is the last attempt, don't wait
+                            if attempt < 1:
+                                await asyncio.sleep(1)
+
+                return False
         except Exception as e:
             logger.error(f"Error importing file: {e}")
             return False
@@ -458,14 +470,14 @@ class TGFSBot:
                 return
 
 
+        if not message.reply_to_message:
+            return
+
         for index_session_id, index_session in list(self.index_sessions.items()):
             if (index_session['user_id'] == user_id and
                     index_session.get('expecting_reply_to') == message.reply_to_message.id):
                 await self.handle_index_session_text(client, message, index_session_id, index_session)
                 return
-
-        if not message.reply_to_message:
-            return
 
         for import_session_id, import_session in self.import_sessions.items():
             if (import_session['user_id'] == user_id and
@@ -623,7 +635,9 @@ class TGFSBot:
             "⚠️ **Important:**\n"
             "• The ID should be from a **CHANNEL** (not a group)\n"
             "• Add this bot as an **admin** to that channel\n"
-            "• The bot needs permission to read messages",
+            "• The bot needs permission to read messages\n\n"
+            "• SEND YOUR INDEX CHANNEL ID AS A REPLY TO THIS MESSAGE\n\n"
+            "• IF YOU ARE USING MULTI BOT MODE FOR INDEXING, MAKE SURE ALL YOUR BOTS ARE ADMINS IN BOTH TARGET AND SOURCE CHANNELS",
             reply_to_message_id=message.id
         )
 
@@ -926,14 +940,32 @@ class TGFSBot:
         )
         index_session['progress_task'] = progress_task
 
+    async def get_next_bot_client(self) -> Client:
+        """Get the next bot client in round-robin fashion"""
+        if not self.multi_index_bot_holder:
+            return self.app  # Fall back to main bot if no helpers
+
+        # Get all bot IDs and sort them for consistent ordering
+        bot_ids = sorted(self.multi_index_bot_holder.keys())
+
+        # Get the next bot
+        bot_id = bot_ids[self._bot_round_robin_index % len(bot_ids)]
+        self._bot_round_robin_index += 1
+
+        return self.multi_index_bot_holder[bot_id]
+
     async def process_channel_indexing(self, client, index_session_id: str):
-        """Process channel indexing message by message with flood wait handling"""
+        """Process channel indexing with multiple messages concurrently using all available bots"""
         index_session = self.index_sessions[index_session_id]
 
         channel_id = index_session['channel_id']
         end_message_id = index_session['end_message_id']
         target_path = index_session['target_path']
         current_message_id = index_session['current_message_id']
+
+        # Get all available bots (main + helpers)
+        all_bots = [self.app] + list(self.multi_index_bot_holder.values())
+        batch_size = len(all_bots)
 
         try:
             while current_message_id <= end_message_id and index_session.get('is_running'):
@@ -942,58 +974,51 @@ class TGFSBot:
                     index_session['flood_wait_until'] = None
                     index_session['flood_wait_reason'] = None
 
-                    # Get message with flood wait handling
-                    msg = await self._get_message_with_flood_wait(client, channel_id, current_message_id, index_session)
+                    # Calculate batch end ID
+                    batch_end_id = min(current_message_id + batch_size - 1, end_message_id)
 
-                    if not index_session.get('is_running'):  # Check if stopped during flood wait
+                    # Create tasks for each message in the batch
+                    tasks = []
+                    for message_id in range(current_message_id, batch_end_id + 1):
+                        # Assign bot in round-robin fashion
+                        bot_index = (message_id - current_message_id) % len(all_bots)
+                        current_bot = all_bots[bot_index]
+
+                        tasks.append(
+                            self._process_single_message(
+                                current_bot, channel_id, message_id, target_path, index_session
+                            )
+                        )
+
+                    # Process batch concurrently
+                    batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                    if not index_session.get('is_running'):
                         break
 
-                    if msg and not msg.empty:
-                        # Check if message has media
-                        file_info = self.extract_file_info(msg)
+                    # Update counts
+                    for result in batch_results:
+                        if isinstance(result, Exception):
+                            index_session['failed_count'] += 1
+                        elif result is True:
+                            index_session['success_count'] += 1
+                        elif result is False:
+                            index_session['failed_count'] += 1
+                        # None results are for non-media messages, don't count as failures
 
-                        if file_info:
-                            try:
-                                # Send to storage channel (also with flood wait handling)
-                                storage_msg = await self._send_to_storage_with_flood_wait(
-                                    client, msg, file_info, channel_id, index_session
-                                )
+                    index_session['processed_count'] += len(tasks)
+                    current_message_id = batch_end_id + 1
+                    index_session['current_message_id'] = current_message_id
 
-                                if not index_session.get('is_running'):  # Check if stopped during flood wait
-                                    break
-
-                                if storage_msg:
-                                    # Import to TGFS
-                                    success = await self.import_file(
-                                        directory=target_path,
-                                        filename=file_info['name'],
-                                        channel_id=self.storage_channel_id,
-                                        message_id=storage_msg.id
-                                    )
-
-                                    if success:
-                                        index_session['success_count'] += 1
-                                    else:
-                                        index_session['failed_count'] += 1
-                                else:
-                                    index_session['failed_count'] += 1
-
-                            except Exception as e:
-                                logger.error(f"Error processing message {current_message_id}: {e}")
-                                index_session['failed_count'] += 1
-
-                    index_session['processed_count'] += 1
+                    # Small delay between batches to avoid rate limits
+                    if not index_session.get('flood_wait_until'):
+                        await asyncio.sleep(self.small_flood_wait)
 
                 except Exception as e:
-                    logger.error(f"Error getting message {current_message_id}: {e}")
-                    index_session['failed_count'] += 1
-
-                current_message_id += 1
-                index_session['current_message_id'] = current_message_id
-
-                # Small delay to avoid rate limits
-                if not index_session.get('flood_wait_until'):
-                    await asyncio.sleep(self.small_flood_wait)
+                    logger.error(f"Error processing batch starting at {current_message_id}: {e}")
+                    index_session['failed_count'] += batch_size
+                    current_message_id += batch_size
+                    index_session['current_message_id'] = current_message_id
 
             # Mark as completed
             index_session['is_running'] = False
@@ -1004,30 +1029,71 @@ class TGFSBot:
             index_session['is_running'] = False
             index_session['error'] = str(e)
 
-    async def _get_message_with_flood_wait(self, client, channel_id: int, message_id: int, index_session: dict):
-        """Get message with flood wait handling"""
+    async def _process_single_message(self, bot_client: Client, channel_id: int, message_id: int,
+                                      target_path: str, index_session: dict) -> Optional[bool]:
+        """Process a single message with the specified bot client"""
+        try:
+            # Get message with flood wait handling
+            msg = await self._get_message_with_flood_wait(bot_client, channel_id, message_id, index_session)
+
+            if not index_session.get('is_running'):
+                return None
+
+            if msg and not msg.empty:
+                # Check if message has media
+                file_info = self.extract_file_info(msg)
+
+                if file_info:
+                    # Send to storage channel with flood wait handling
+                    storage_msg = await self._send_to_storage_with_flood_wait(
+                        bot_client, msg, file_info, channel_id, index_session
+                    )
+
+                    if not index_session.get('is_running'):
+                        return None
+
+                    if storage_msg:
+                        # Import to TGFS
+                        success = await self.import_file(
+                            directory=target_path,
+                            filename=file_info['name'],
+                            channel_id=self.storage_channel_id,
+                            message_id=storage_msg.id
+                        )
+                        return success
+                    else:
+                        return False
+            # Return None for non-media messages (don't count as failure)
+            return None
+        except Exception as e:
+            logger.error(f"Error processing message {message_id}: {e}")
+            return False
+
+    async def _get_message_with_flood_wait(self, bot_client: Client, channel_id: int, message_id: int,
+                                           index_session: dict):
+        """Get message with flood wait handling using specified bot client"""
         max_retries = 3
         retry_count = 0
 
         while retry_count < max_retries:
             try:
-                return await client.get_messages(channel_id, message_id)
+                return await bot_client.get_messages(channel_id, message_id)
             except FloodWait as e:
                 wait_time = e.value
                 cooldown_time = self.big_flood_wait
                 total_wait = wait_time + cooldown_time
 
-                logger.info(f"FloodWait: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
+                logger.info(f"FloodWait on bot {bot_client.name if hasattr(bot_client, 'name') else 'main'}: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
 
                 # Store flood wait info for progress display
                 index_session['flood_wait_until'] = time.time() + total_wait
-                index_session['flood_wait_reason'] = f"get_messages (message {message_id})"
+                index_session['flood_wait_reason'] = f"get_messages (message {message_id}) using bot {bot_client.name if hasattr(bot_client, 'name') else 'main'}"
 
                 await asyncio.sleep(total_wait)
                 retry_count += 1
 
             except Exception as e:
-                logger.error(f"Error getting message {message_id}: {e}")
+                logger.error(f"Error getting message {message_id} with bot {bot_client.name if hasattr(bot_client, 'name') else 'main'}: {e}")
                 if retry_count < max_retries - 1:
                     await asyncio.sleep(2)
                     retry_count += 1
@@ -1036,9 +1102,9 @@ class TGFSBot:
 
         return None
 
-    async def _send_to_storage_with_flood_wait(self, client, msg, file_info: dict, source_channel_id: int,
+    async def _send_to_storage_with_flood_wait(self, bot_client: Client, msg, file_info: dict, source_channel_id: int,
                                                index_session: dict):
-        """Send file to storage channel with flood wait handling"""
+        """Send file to storage channel with flood wait handling using specified bot client"""
         max_retries = 3
         retry_count = 0
 
@@ -1046,31 +1112,31 @@ class TGFSBot:
             try:
                 # Send based on media type
                 if msg.video:
-                    return await client.send_video(
+                    return await bot_client.send_video(
                         chat_id=self.storage_channel_id,
                         video=file_info['file_id'],
                         caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
                     )
                 elif msg.document:
-                    return await client.send_document(
+                    return await bot_client.send_document(
                         chat_id=self.storage_channel_id,
                         document=file_info['file_id'],
                         caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
                     )
                 elif msg.audio:
-                    return await client.send_audio(
+                    return await bot_client.send_audio(
                         chat_id=self.storage_channel_id,
                         audio=file_info['file_id'],
                         caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
                     )
                 elif msg.voice:
-                    return await client.send_voice(
+                    return await bot_client.send_voice(
                         chat_id=self.storage_channel_id,
                         voice=file_info['file_id'],
                         caption=f"📺 Indexed from {source_channel_id} | {file_info['name']}"
                     )
                 elif msg.video_note:
-                    return await client.send_video_note(
+                    return await bot_client.send_video_note(
                         chat_id=self.storage_channel_id,
                         video_note=file_info['file_id']
                     )
@@ -1080,17 +1146,17 @@ class TGFSBot:
                 cooldown_time = self.big_flood_wait
                 total_wait = wait_time + cooldown_time
 
-                logger.info(f"FloodWait on send: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
+                logger.info(f"FloodWait on bot {bot_client.name if hasattr(bot_client, 'name') else 'main'} send: {wait_time}s + {cooldown_time}s cooldown = {total_wait}s total")
 
                 # Store flood wait info for progress display
                 index_session['flood_wait_until'] = time.time() + total_wait
-                index_session['flood_wait_reason'] = f"send_to_storage ({file_info['name']})"
+                index_session['flood_wait_reason'] = f"send_to_storage ({file_info['name']}) using bot {bot_client.name if hasattr(bot_client, 'name') else 'main'}"
 
                 await asyncio.sleep(total_wait)
                 retry_count += 1
 
             except Exception as e:
-                logger.error(f"Error sending file {file_info['name']}: {e}")
+                logger.error(f"Error sending file {file_info['name']} with bot {bot_client.name if hasattr(bot_client, 'name') else 'main'}: {e}")
                 if retry_count < max_retries - 1:
                     await asyncio.sleep(2)
                     retry_count += 1
@@ -1124,6 +1190,10 @@ class TGFSBot:
                 flood_wait_until = index_session.get('flood_wait_until')
                 flood_wait_reason = index_session.get('flood_wait_reason', '')
 
+                # Add bot usage info
+                bot_count = len(self.multi_index_bot_holder) + 1  # +1 for main bot
+                bot_info = f"🤖 **Bots Active:** {bot_count} (main + {len(self.multi_index_bot_holder)} helpers)\n"
+
                 status_line = ""
                 if flood_wait_until and time.time() < flood_wait_until:
                     remaining_wait = int(flood_wait_until - time.time())
@@ -1152,6 +1222,7 @@ class TGFSBot:
                     f"📊 **Channel Indexing Progress**\n\n"
                     f"📺 **Channel:** `{index_session['channel_id']}`\n"
                     f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"{bot_info}"
                     f"{status_line}"
                     f"🔄 **Progress:** {progress_percent:.1f}%\n"
                     f"`{bar}` {processed}/{total}\n\n"
@@ -1183,9 +1254,10 @@ class TGFSBot:
                     f"🎉 **Channel Indexing Complete!**\n\n"
                     f"📺 **Channel:** `{index_session['channel_id']}`\n"
                     f"📁 **Target:** `{unquote(index_session['target_path'])}`\n\n"
+                    f"🤖 **Bots Used:** {len(self.multi_index_bot_holder) + 1}\n\n"
                     f"📊 **Results:**\n"
                     f"✅ **Success:** {index_session.get('success_count', 0)}\n"
-                    f"⚠️ **Unsupported/Text Messages:** {max(0, index_session.get('total_messages', 0) - 
+                    f"⚠️ **Unsupported/Text Messages:** {max(0, index_session.get('total_messages', 0) -
                                                              (index_session.get('success_count', 0) + index_session.get('failed_count', 0)))}\n"
                     f"❌ **Failed:** {index_session.get('failed_count', 0)}\n"
                     f"📈 **Total Processed:** {index_session.get('processed_count', 0)}\n"
@@ -3039,6 +3111,102 @@ class TGFSBot:
                     f"{len(expired_index_sessions)} expired index sessions"
                 )
 
+    async def initialize_helper_bots(self):
+        """Initialize helper bot clients using bot tokens concurrently"""
+        if not self.multi_index_bots:
+            logger.info("No helper bots configured")
+            return
+
+        async def init_single_bot(i, bot_token):
+            try:
+                # Extract bot ID from token (the part before the colon)
+                bot_id = bot_token.split(':')[0]
+
+                client = Client(
+                    f"helper_bot_{i}",
+                    api_id=self.api_id,
+                    api_hash=self.api_hash,
+                    bot_token=bot_token,
+                    in_memory=True
+                )
+
+                self.multi_index_bot_holder[bot_id] = client
+                logger.info(f"Initialized helper bot client for token index: {i}")
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to initialize helper bot {i}: {e}")
+                return False
+
+        # Initialize all bots concurrently
+        tasks = [
+            init_single_bot(i, bot_token)
+            for i, bot_token in enumerate(self.multi_index_bots)
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Count successful initializations
+        successful = sum(1 for result in results if result is True)
+        logger.info(f"Successfully initialized {successful}/{len(self.multi_index_bots)} helper bots")
+
+    async def start_helper_bots(self):
+        """Start all helper bot clients concurrently"""
+        if not self.multi_index_bot_holder:
+            logger.info("No helper bots to start")
+            return
+
+        async def start_single_bot(bot_id, client):
+            try:
+                await client.start()
+                me = await client.get_me()
+                logger.info(f"Helper bot started: @{me.username} (ID: {me.id})")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to start helper bot {bot_id}: {e}")
+                return False
+
+        # Start all bots concurrently
+        tasks = [
+            start_single_bot(bot_id, client)
+            for bot_id, client in self.multi_index_bot_holder.items()
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Count successful starts
+        successful = sum(1 for result in results if result is True)
+        logger.info(f"Successfully started {successful}/{len(self.multi_index_bot_holder)} helper bots")
+
+    async def stop_helper_bots(self):
+        """Stop all helper bot clients concurrently"""
+        if not self.multi_index_bot_holder:
+            logger.info("No helper bots to stop")
+            return
+
+        async def stop_single_bot(bot_id, client):
+            try:
+                if hasattr(client, 'is_connected') and client.is_connected:
+                    await client.stop()
+                    logger.info(f"Stopped helper bot: {bot_id}")
+                    return True
+                return False
+            except Exception as e:
+                logger.error(f"Error stopping helper bot {bot_id}: {e}")
+                return False
+
+        # Stop all bots concurrently
+        tasks = [
+            stop_single_bot(bot_id, client)
+            for bot_id, client in self.multi_index_bot_holder.items()
+        ]
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Count successful stops
+        successful = sum(1 for result in results if result is True)
+        logger.info(f"Successfully stopped {successful}/{len(self.multi_index_bot_holder)} helper bots")
+
     async def run(self):
         """Start the bot"""
         cleanup_task = None
@@ -3050,6 +3218,7 @@ class TGFSBot:
                 return
             logger.info("TGFS authentication successful")
 
+            # Initialize main bot client
             self.app = Client(
                 "tgfs_bot",
                 api_id=self.api_id,
@@ -3058,11 +3227,19 @@ class TGFSBot:
                 in_memory=True
             )
 
+            # Initialize helper bot clients
+            logger.info("Initializing helper bot clients...")
+            await self.initialize_helper_bots()
+
             logger.info("Registering handlers...")
             self.register_handlers()
 
             logger.info("Starting TGFS Bot...")
             await self.app.start()
+
+            # Start all helper bot clients
+            logger.info("Starting helper bot clients...")
+            await self.start_helper_bots()
 
             result = await self.app.set_bot_commands([
                 BotCommand("start", "Start the bot"),
@@ -3096,6 +3273,9 @@ class TGFSBot:
             logger.error(f"Failed to start bot: {e}")
             raise
         finally:
+            # Stop all helper bots first
+            await self.stop_helper_bots()
+
             if cleanup_task:
                 cleanup_task.cancel()
             if self.app and hasattr(self.app, 'is_connected') and self.app.is_connected:
