@@ -66,6 +66,73 @@ class TGFSBot:
         # Initialize Pyrogram client variable
         self.app = None
 
+        # Token Management
+        self.token_last_checked = None
+        self.token_check_interval = int(os.getenv('TOKEN_CHECK_INTERVAL', '3600'))
+        self.token_check_task = None
+
+    async def validate_token(self):
+        """Validate the current token and refresh if needed"""
+        if not self.auth_token:
+            return await self.authenticate()
+
+        try:
+            headers = await self.get_auth_headers()
+            test_path = quote(f'/webdav/{ROOT_FOLDER_NAME}', safe='')
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                        f"{self.tgfs_base_url}/api/tasks?path={test_path}",
+                        headers=headers,
+                        timeout=10
+                ) as response:
+                    if response.status == 200:
+                        logger.info("Token validation successful")
+                        return True
+                    elif response.status == 401:
+                        logger.warning("Token expired, refreshing...")
+                        return await self.authenticate()
+                    else:
+                        logger.warning(f"Token validation failed with status: {response.status}")
+                        return False
+
+        except Exception as e:
+            logger.error(f"Token validation error: {e}")
+            return False
+
+    async def token_validation_loop(self):
+        """Periodic token validation loop"""
+        while True:
+            try:
+                await asyncio.sleep(self.token_check_interval)
+                logger.info("Running periodic token validation...")
+                await self.validate_token()
+                self.token_last_checked = datetime.now()
+            except asyncio.CancelledError:
+                logger.info("Token validation loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in token validation loop: {e}")
+                await asyncio.sleep(300)
+
+    async def start_token_validation(self):
+        """Start the token validation background task"""
+        if self.token_check_task and not self.token_check_task.done():
+            self.token_check_task.cancel()
+
+        self.token_check_task = asyncio.create_task(self.token_validation_loop())
+        logger.info("Token validation task started")
+
+    async def stop_token_validation(self):
+        """Stop the token validation background task"""
+        if self.token_check_task:
+            self.token_check_task.cancel()
+            try:
+                await self.token_check_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Token validation task stopped")
+
     def register_handlers(self):
         """Register all message and callback handlers"""
 
@@ -448,7 +515,7 @@ class TGFSBot:
         if message.text == '/start':
             await message.reply(
                 "🤖 **TGFS File Manager Bot**\n\n"
-                "Send me any file (photo, video, document, audio) and I'll help you organize it in your TGFS storage!\n\n"
+                "Send me any file (photo, video, document, audio) and I'll help you organize it in your TGFS WEBDAV server!\n\n"
                 "Commands:\n"
                 "• Send or forward a file(s) - Start file organization and importing\n"
                 "• /browse - Manage files, Upload/Import multiple files, Browse folder structure\n"
@@ -3298,6 +3365,9 @@ class TGFSBot:
 
             cleanup_task = asyncio.create_task(self.cleanup_old_sessions())
 
+            # Start Token Validation Task
+            await self.start_token_validation()
+
             logger.info("Bot is now running and listening for messages...")
             logger.info("👨‍💻 TGFS Manger => Created by The Seeker")
 
@@ -3317,6 +3387,7 @@ class TGFSBot:
         finally:
             # Stop all helper bots first
             await self.stop_helper_bots()
+            await self.stop_token_validation()
 
             if cleanup_task:
                 cleanup_task.cancel()
