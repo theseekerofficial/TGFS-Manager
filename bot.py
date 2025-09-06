@@ -405,7 +405,20 @@ class TGFSBot:
 
                     # Get display name
                     display_name_elem = response.find('.//D:displayname', namespaces)
-                    display_name = display_name_elem.text if display_name_elem is not None else href.split('/')[-1]
+
+                    if display_name_elem is not None and display_name_elem.text:
+                        display_name = display_name_elem.text
+                        # Check if this is a root-level item with wrong displayname
+                        if (display_name == 'root' and
+                                href.startswith('/webdav/') and
+                                href.count('/') == 3):  # /webdav/folder_name/ pattern
+                            # Extract name from href for root-level folders
+                            clean_path = href[len('/webdav/'):].rstrip('/')
+                            display_name = clean_path if clean_path else 'Root'
+                    else:
+                        # Fallback: extract from path
+                        path_parts = href.rstrip('/').split('/')
+                        display_name = path_parts[-1] if path_parts else href
 
                     # Get content length for files
                     content_length = 0
