@@ -2129,6 +2129,7 @@ class TGFSBot:
 
                 import_session = self.import_sessions[import_session_id]
                 import_session['current_path'] = folder_path
+                import_session['current_page'] = 1
                 new_keyboard = await self.create_browse_keyboard(folder_path, import_session_id)
 
                 await callback_query.edit_message_text(
@@ -2140,7 +2141,7 @@ class TGFSBot:
 
                 folder_name = unquote(folder_path.rstrip('/').split('/')[-1])
                 if not folder_name or folder_path == f'/webdav/{ROOT_FOLDER_NAME}':
-                    folder_name = 'Root' if not ROOT_FOLDER_NAME else ROOT_FOLDER_NAME
+                    folder_name = 'Root Channels'
                 await callback_query.answer(f"📁 Browsing: {folder_name}")
 
             elif action == "browse_page":
@@ -2467,6 +2468,7 @@ class TGFSBot:
                     return
 
                 session['current_path'] = folder_path
+                session['current_page'] = 1  # Reset to first page when navigating
                 new_keyboard = await self.create_index_path_keyboard(folder_path, session_id)
 
                 await callback_query.edit_message_text(
@@ -2474,6 +2476,11 @@ class TGFSBot:
                     f"🛣️ **Current Path:** `{unquote(folder_path)}`",
                     reply_markup=new_keyboard
                 )
+
+                folder_name = unquote(folder_path.rstrip('/').split('/')[-1])
+                if not folder_name or folder_path == f'/webdav/{ROOT_FOLDER_NAME}':
+                    folder_name = 'Root Channels'
+                await callback_query.answer(f"📁 Browsing: {folder_name}")
 
             elif action == "index_select_path":
                 # Path selected, ask for skip number
@@ -2548,6 +2555,7 @@ class TGFSBot:
                 return
 
             file_session['current_path'] = folder_path
+            file_session['current_page'] = 1
             new_keyboard = await self.create_folder_keyboard(folder_path, file_session_id)
 
             # Update the message
@@ -2562,7 +2570,7 @@ class TGFSBot:
             )
             folder_name = unquote(folder_path.rstrip('/').split('/')[-1])
             if not folder_name or folder_path == f'/webdav/{ROOT_FOLDER_NAME}':
-                folder_name = 'Root' if not ROOT_FOLDER_NAME else ROOT_FOLDER_NAME
+                folder_name = 'Root Channels'
             await callback_query.answer(f"📁 Browsing: {folder_name}")
 
         elif action == "select":
