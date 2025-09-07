@@ -41,6 +41,7 @@ class TGFSBot:
             token.strip() for token in os.getenv("INDEX_BOT_TOKENS", "").split(",") if token.strip()
         ]
         self.multi_index_bot_holder: Dict[str, Client] = {}
+        self.multi_index_bot_data_holder: List[str] = []
         self.storage_channel_id = int(os.getenv('STORAGE_CHANNEL_ID', '0'))
         self.enable_upload_records = os.getenv('ENABLE_UPLOAD_RECORDS', 'False').lower() in ['true', '1', 't']
         self.items_per_page = int(os.getenv('ITEMS_PER_PAGE', '10'))
@@ -680,7 +681,8 @@ class TGFSBot:
             'items_per_page': self.items_per_page,
             'files_to_import': [],  # Store files for batch import
             'waiting_for_files': False,
-            'original_message_id': message.id
+            'original_message_id': message.id,
+            'scroll_history': {}
         }
 
         # Send browsing message
@@ -707,16 +709,24 @@ class TGFSBot:
             'user_id': user_id,
             'created_time': time.time(),
             'step': 'waiting_channel_id',
-            'original_message_id': message.id
+            'original_message_id': message.id,
+            'scroll_history': {}
         }
+
+        my_data = await self.app.get_me()
+
+        helper_bots = ""
+        if self.multi_index_bot_data_holder:
+            helper_bots_list = "\n".join(f"    - @{u}" for u in self.multi_index_bot_data_holder)
+            helper_bots = f"and these helper bots:\n{helper_bots_list}"
 
         reply_msg = await message.reply(
             "📺 **Channel Indexing**\n\n"
             "Please send the channel ID (e.g., `-100123456789`).\n\n"
             "⚠️ **Important:**\n"
             "• The ID should be from a **CHANNEL** (not a group)\n"
-            "• Add this bot as an **admin** to that channel\n"
-            "• The bot needs permission to read messages\n\n"
+            f"• Add this bot (@{my_data.username}) {helper_bots} as an **admin** to that channel\n"
+            "• The bot(s) needs permission to read messages\n\n"
             "• SEND YOUR INDEX CHANNEL ID AS A REPLY TO THIS MESSAGE\n\n"
             "• IF YOU ARE USING MULTI BOT MODE FOR INDEXING, MAKE SURE ALL YOUR BOTS ARE ADMINS IN BOTH TARGET AND SOURCE CHANNELS",
             reply_to_message_id=message.id
@@ -1482,7 +1492,8 @@ class TGFSBot:
             'target_path': None,
             'expecting_reply_to': None,
             'current_page': 1,
-            'items_per_page': self.items_per_page
+            'items_per_page': self.items_per_page,
+            'scroll_history': {}
         }
 
         # Store in user session for easy access
@@ -2128,8 +2139,12 @@ class TGFSBot:
                     return
 
                 import_session = self.import_sessions[import_session_id]
+
+                current_path = import_session['current_path']
+                import_session['scroll_history'][current_path] = import_session.get('current_page', 1)
+
                 import_session['current_path'] = folder_path
-                import_session['current_page'] = 1
+                import_session['current_page'] = import_session['scroll_history'].get(folder_path, 1)
                 new_keyboard = await self.create_browse_keyboard(folder_path, import_session_id)
 
                 await callback_query.edit_message_text(
@@ -2467,8 +2482,11 @@ class TGFSBot:
                     await callback_query.answer("Invalid navigation path", show_alert=True)
                     return
 
+                current_path = session['current_path']
+                session['scroll_history'][current_path] = session.get('current_page', 1)
+
                 session['current_path'] = folder_path
-                session['current_page'] = 1  # Reset to first page when navigating
+                session['current_page'] = session['scroll_history'].get(folder_path, 1)
                 new_keyboard = await self.create_index_path_keyboard(folder_path, session_id)
 
                 await callback_query.edit_message_text(
@@ -2554,8 +2572,11 @@ class TGFSBot:
                 await callback_query.answer("Invalid navigation path", show_alert=True)
                 return
 
+            current_path = file_session['current_path']
+            file_session['scroll_history'][current_path] = file_session.get('current_page', 1)
+
             file_session['current_path'] = folder_path
-            file_session['current_page'] = 1
+            file_session['current_page'] = file_session['scroll_history'].get(folder_path, 1)
             new_keyboard = await self.create_folder_keyboard(folder_path, file_session_id)
 
             # Update the message
@@ -3290,6 +3311,7 @@ class TGFSBot:
             try:
                 await client.start()
                 me = await client.get_me()
+                self.multi_index_bot_data_holder.append(me.username)
                 logger.info(f"Helper bot started: @{me.username} (ID: {me.id})")
                 return True
             except Exception as e:
