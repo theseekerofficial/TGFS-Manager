@@ -2,10 +2,14 @@
 
 import os
 import re
+import sys
 import time
+import math
 import aiohttp
 import asyncio
 import logging
+import requests
+import configparser
 from datetime import datetime
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
@@ -13,7 +17,7 @@ from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
 from typing import Dict, List, Optional
 from pyrogram import utils as pyroutils
-from urllib.parse import unquote, quote
+from urllib.parse import unquote, quote, urlparse
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 logging.basicConfig(
@@ -47,10 +51,13 @@ class TGFSBot:
         self.items_per_page = int(os.getenv('ITEMS_PER_PAGE', '10'))
         self.small_flood_wait = int(os.getenv('SMALL_FLOOD_WAIT', '10'))
         self.big_flood_wait = int(os.getenv('BIG_FLOOD_WAIT', '320'))
+        self.rclone_buffer_size = os.getenv('RCLONE_BUFFER_SIZE', '1G')
         self.path_cache: Dict[str, str] = {}
         self.reverse_path_cache: Dict[str, str] = {}
         self.cache_counter = 0
         self._bot_round_robin_index = 0
+        self.rclone_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rclone.conf')
+        self.rclone_remote = os.getenv('RCLONE_REMOTE', '')
 
         # TGFS API settings
         self.tgfs_base_url = os.getenv('TGFS_BASE_URL', 'https://tg-webdav.mlwa.xyz')
@@ -63,6 +70,7 @@ class TGFSBot:
         self.file_sessions: Dict[str, dict] = {}
         self.import_sessions: Dict[str, dict] = {}
         self.index_sessions: Dict[str, dict] = {}
+        self.rclone_sessions: Dict[str, dict] = {}
 
         # Initialize Pyrogram client variable
         self.app = None
@@ -149,6 +157,18 @@ class TGFSBot:
             if message.from_user.id not in self.allowed_user_ids:
                 await message.reply("Unauthorized", reply_to_message_id=message.id)
                 return
+
+            for rclone_session_id, rclone_session in list(self.rclone_sessions.items()):
+                if rclone_session['user_id'] == message.from_user.id:
+                    if rclone_session.get('step') == 'waiting_config' and message.document:
+                        await self.handle_rclone_config_upload(client, message, rclone_session_id, rclone_session)
+                        return
+                    elif rclone_session.get('step') == 'waiting_link' and message.text:
+                        await self.handle_rclone_link(client, message, rclone_session_id, rclone_session)
+                        return
+                    elif rclone_session.get('step') == 'waiting_path' and message.text:
+                        await self.handle_rclone_path(client, message, rclone_session_id, rclone_session)
+                        return
 
             if message.forward_from_chat:
                 user_id = message.from_user.id
@@ -539,6 +559,8 @@ class TGFSBot:
             await self.handle_browse_command(client, message)
         elif message.text == '/indexchannel':
             await self.handle_index_channel_command(client, message)
+        elif message.text == '/rupload':
+            await self.handle_rupload_command(client, message)
 
     async def handle_text_message(self, client, message: Message):
         """Handle text messages for folder creation with file session support"""
@@ -734,6 +756,60 @@ class TGFSBot:
 
         self.index_sessions[index_session_id]['reply_message_id'] = reply_msg.id
         self.index_sessions[index_session_id]['expecting_reply_to'] = reply_msg.id
+
+    async def handle_rupload_command(self, client, message: Message):
+        """Handle /rupload command for remote file uploads"""
+        user_id = message.from_user.id
+
+        # Check if user is authorized
+        if user_id not in self.allowed_user_ids:
+            await message.reply("❌ Unauthorized", reply_to_message_id=message.id)
+            return
+
+        # Check if rclone config exists
+        if not os.path.exists(self.rclone_config_path):
+            # Ask user to upload rclone.conf
+            reply_msg = await message.reply(
+                "📁 **Rclone Configuration Required**\n\n"
+                "No rclone.conf file found. Please upload your rclone configuration file.\n\n"
+                "⚠️ **Important:**\n\n"
+                "• SEND THE REMOTE NAME AS CAPTION WHEN UPLOADING .CONF FILE\n\n"
+                "• This file should contain your WebDAV remote configuration\n"
+                "• The remote should be configured for your TGFS server\n"
+                "• File will be saved securely on the server\n\n"
+                "**Please upload your rclone.conf file now:**",
+                reply_to_message_id=message.id
+            )
+
+            # Create rclone session
+            rclone_session_id = f"rclone_{user_id}_{message.id}"
+            self.rclone_sessions[rclone_session_id] = {
+                'user_id': user_id,
+                'step': 'waiting_config',
+                'original_message_id': message.id,
+                'reply_message_id': reply_msg.id
+            }
+            return
+
+        # If config exists, ask for direct link
+        reply_msg = await message.reply(
+            "🔗 **Remote File Upload**\n\n"
+            "Please send the direct download link of the file you want to upload.\n\n"
+            "📝 **Supported formats:**\n"
+            "• HTTP/HTTPS direct links\n"
+            "• Files that can be downloaded via wget/curl\n\n"
+            "**Send the download link now:**",
+            reply_to_message_id=message.id
+        )
+
+        # Create rclone session for file upload
+        rclone_session_id = f"rclone_{user_id}_{message.id}"
+        self.rclone_sessions[rclone_session_id] = {
+            'user_id': user_id,
+            'step': 'waiting_link',
+            'original_message_id': message.id,
+            'reply_message_id': reply_msg.id
+        }
 
     async def handle_index_session_text(self, client, message: Message, index_session_id: str, index_session: dict):
         """Handle text input for channel indexing"""
@@ -968,6 +1044,164 @@ class TGFSBot:
 
         await message.delete()
 
+    async def handle_rclone_config_upload(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
+        """Handle rclone configuration file upload"""
+        if not message.document:
+            await message.reply("❌ Please upload a valid rclone.conf file", reply_to_message_id=message.id)
+            return
+
+        if not message.document.file_name or not message.document.file_name.lower().endswith('.conf'):
+            await message.reply("❌ File must be a .conf file", reply_to_message_id=message.id)
+            return
+
+        if not message.caption:
+            await message.reply("❌ Please send the remote name as it's in the conf file as a caption",
+                                reply_to_message_id=message.id)
+            return
+
+        # Download the config file
+        download_msg = await message.reply("📥 Downloading rclone configuration...", reply_to_message_id=message.id)
+
+        try:
+            # Download the file
+            config_file = await client.download_media(message, in_memory=True)
+
+            if not config_file:
+                await download_msg.edit_text("❌ Failed to download configuration file")
+                return
+
+            # Save to rclone config path
+            with open(self.rclone_config_path, 'wb') as f:
+                f.write(config_file.getvalue())
+
+            # Store the remote name from caption
+            self.rclone_remote = message.caption.strip()
+
+            # Verify the remote exists in the config
+            remote_names = self.load_rclone_config()
+            if self.rclone_remote not in remote_names:
+                await download_msg.edit_text(
+                    f"❌ Remote name '{self.rclone_remote}' not found in the configuration file.\n\n"
+                    "Please check that:\n"
+                    "1. The remote name in your caption matches exactly what's in rclone.conf\n"
+                    "2. The uploaded file is a valid rclone configuration\n\n"
+                    "Try uploading again with the correct remote name as caption."
+                )
+                return
+
+            await download_msg.edit_text(
+                f"✅ **Rclone Configuration Saved!**\n\n"
+                f"**Remote name:** `{self.rclone_remote}`\n\n"
+                "Now you can use /rupload to upload files from direct links."
+            )
+
+            await message.delete()
+
+            # Clean up session
+            if rclone_session_id in self.rclone_sessions:
+                del self.rclone_sessions[rclone_session_id]
+
+        except Exception as e:
+            logger.error(f"Error saving rclone config: {e}")
+            await download_msg.edit_text(f"❌ Error saving configuration: {str(e)}")
+
+        await message.delete()
+
+    @staticmethod
+    def get_file_name(d_link):
+        response = requests.head(d_link, allow_redirects=True)
+
+        # Try to get filename from Content-Disposition header
+        if 'content-disposition' in response.headers:
+            cd = response.headers['content-disposition']
+            # Extract filename using regex
+            filename = re.findall('filename=(.+)', cd)
+            if filename:
+                return filename[0].strip('"')
+
+        # Fallback: extract from URL path
+        parsed_url = urlparse(d_link)
+        return os.path.basename(parsed_url.path)
+
+    async def handle_rclone_link(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
+        """Handle direct link input for rclone upload"""
+
+        download_link = message.text.strip()
+
+        # Basic URL validation
+        if not (download_link.startswith('http://') or download_link.startswith('https://')):
+            await message.reply("❌ Invalid URL. Please provide a valid HTTP/HTTPS link", reply_to_message_id=message.id)
+            return
+
+        # Store the download link and move to path selection
+        rclone_session['download_link'] = download_link
+        rclone_session['step'] = 'waiting_path'
+
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=rclone_session['reply_message_id'],
+            text=(
+                f"🔗 **Remote File Upload**\n\n"
+                f"📄 **File:** `{self.get_file_name(download_link)}`\n"
+                f"🔗 **URL:** `{download_link[:50]}...`\n\n"
+                "**Please send the destination path where the file should be saved.**\n\n"
+                f"**Default Remote name:** `{self.rclone_remote}`\n\n"
+                f"**If you want to use another remote in the conf file, send the remote name with the path separating by** `:`\n"
+                f"Available remotes: `{", ".join(self.load_rclone_config())}`\n\n"
+                "📝 **Examples:**\n"
+                "• `movies/action/` - Save in movies/action folder in default remote\n"
+                "• `videos/` - Save in videos folder in default remote\n"
+                "• `/` - Save in root folder in default remote\n"
+                "• `Google_Drive:movies/action/` - Save in movies/action folder in Google_Drive remote\n"
+                "• `Google_Drive:videos/` - Save in videos folder in Google_Drive remote\n"
+                "• `Google_Drive:/` - Save in root folder in Google_Drive remote\n\n"
+                "**Send the destination path now:**"
+            )
+        )
+
+        await message.delete()
+
+    async def handle_rclone_path(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
+        """Handle destination path input for rclone upload"""
+        destination_path = message.text.strip()
+
+        if ':' in destination_path:
+            remote_name, path = destination_path.split(':', 1)
+            if remote_name not in self.load_rclone_config():
+                await message.reply("❌ Remote name not found in the configuration file", reply_to_message_id=message.id)
+                return
+            else:
+                self.rclone_remote = remote_name
+                destination_path = path
+
+        if not destination_path == '/' and not destination_path.endswith('/'):
+            destination_path += '/'
+        elif destination_path == '/':
+            destination_path = ''
+
+        rclone_session['destination_path'] = destination_path
+        rclone_session['step'] = 'ready_to_upload'
+
+        await client.edit_message_text(
+            chat_id=message.chat.id,
+            message_id=rclone_session['reply_message_id'],
+            text=(
+                f"🔗 **Remote File Upload - Ready**\n\n"
+                f"📄 **File:** `{self.get_file_name(rclone_session['download_link'])}`\n"
+                f"🔗 **URL:** `{rclone_session['download_link'][:50]}...`\n"
+                f"📁 **Destination:** `{destination_path if destination_path != '' else '/'}`\n\n"
+                "**Ready to start upload?**"
+            ),
+            reply_markup=InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("🚀 Start Upload", callback_data=f"rclone_start:{rclone_session_id}"),
+                    InlineKeyboardButton("❌ Cancel", callback_data=f"rclone_cancel:{rclone_session_id}")
+                ]
+            ])
+        )
+
+        await message.delete()
+
     async def create_index_path_keyboard(self, current_path: str, index_session_id: str) -> InlineKeyboardMarkup:
         """Create keyboard for path selection during indexing setup"""
         items = await self.get_folder_structure(current_path)
@@ -1014,6 +1248,288 @@ class TGFSBot:
             keyboard.append(action_row_2)
 
         return InlineKeyboardMarkup(keyboard)
+
+    async def create_folder_keyboard(self, current_path: str, file_session_id: str) -> InlineKeyboardMarkup:
+        """Create inline keyboard for folder and file navigation with pagination"""
+        items = await self.get_folder_structure(current_path)
+        keyboard = []
+
+        # Get pagination info from file session
+        file_session = self.file_sessions.get(file_session_id, {})
+        current_page = file_session.get('current_page', 1)
+        items_per_page = file_session.get('items_per_page', 10)
+
+        # Separate folders and files
+        folders = [item for item in items if item['is_directory']]
+        files = [item for item in items if not item['is_directory']]
+        all_items = folders + files
+
+        # Calculate pagination
+        total_items = len(all_items)
+        total_pages = (total_items + items_per_page - 1) // items_per_page
+
+        # Add pagination numbers at top, if more than 1 page
+        if total_pages > 1:
+            page_buttons = []
+
+            if total_pages <= 10:
+                # Show all page numbers
+                for page in range(1, total_pages + 1):
+                    button_text = f"• {page} •" if page == current_page else str(page)
+                    page_buttons.append(
+                        InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                    )
+            else:
+                # Handle more than 10 pages
+                if current_page <= 8:
+                    # Show pages 1-8, ..., last_page
+                    for page in range(1, 9):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+                else:
+                    # Show 1, ..., current_page-1, current_page, current_page+1, ..., last_page
+                    page_buttons.append(
+                        InlineKeyboardButton("1", callback_data=f"page:{file_session_id}:1")
+                    )
+                    page_buttons.append(
+                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:1")
+                    )
+
+                    for page in range(max(2, current_page - 1), min(total_pages, current_page + 2)):
+                        button_text = f"• {page} •" if page == current_page else str(page)
+                        page_buttons.append(
+                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
+                        )
+
+                    if current_page < total_pages - 1:
+                        page_buttons.append(
+                            InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
+                        )
+                    page_buttons.append(
+                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
+                    )
+
+            # Add page buttons in rows of 5
+            for i in range(0, len(page_buttons), 5):
+                keyboard.append(page_buttons[i:i + 5])
+
+        # Get items for current page
+        start_idx = (current_page - 1) * items_per_page
+        end_idx = start_idx + items_per_page
+        page_items = all_items[start_idx:end_idx]
+
+        # Add item buttons (1 per row) with numbering
+        item_number = 1
+        for item in page_items:
+            if item['is_directory']:
+                path_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(f"{item_number}. 📁 {item['name']}", callback_data=f"nav:{file_session_id}:{path_hash}")
+                ])
+            else:
+                file_hash = self.get_path_hash(item['path'])
+                keyboard.append([
+                    InlineKeyboardButton(
+                        f"{item_number}. 📄 {item['name']} ({self.format_file_size(item['size'])})",
+                        callback_data=f"file_delete_confirm:{file_session_id}:{file_hash}"
+                    )
+                ])
+            item_number += 1
+
+        # Add action buttons
+        action_row_1 = []
+        action_row_2 = []
+        action_row_3 = []
+
+        # Back button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
+            if parent_path == '/webdav':
+                parent_path = f'/webdav/{ROOT_FOLDER_NAME}'
+
+            parent_hash = self.get_path_hash(parent_path)
+            action_row_1.append(
+                InlineKeyboardButton("⬅️ Back", callback_data=f"nav:{file_session_id}:{parent_hash}")
+            )
+
+        # Select current location (for file uploads)
+        current_hash = self.get_path_hash(current_path)
+        action_row_1.append(
+            InlineKeyboardButton("✅ Select Here", callback_data=f"select:{file_session_id}:{current_hash}")
+        )
+
+        # Create new folder
+        action_row_2.append(
+            InlineKeyboardButton("➕ New Folder", callback_data=f"newfolder:{file_session_id}:{current_hash}")
+        )
+
+        # Create folder from filename
+        action_row_2.append(
+            InlineKeyboardButton("📂 Folder from File Name",
+                                 callback_data=f"folderfromname:{file_session_id}:{current_hash}")
+        )
+
+        # Delete current folder button (if not at root)
+        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete This Folder",
+                                     callback_data=f"delete_confirm:{file_session_id}:{current_hash}")
+            )
+
+        # Delete multiple items button (if there are items to delete)
+        if all_items and current_path != f'/webdav/{ROOT_FOLDER_NAME}':
+            action_row_3.append(
+                InlineKeyboardButton("🗑️ Delete Multiple",
+                                     callback_data=f"delete_multiple:{file_session_id}:{current_hash}")
+            )
+
+        if action_row_1:
+            keyboard.append(action_row_1)
+        if action_row_2:
+            keyboard.append(action_row_2)
+        if action_row_3:
+            keyboard.append(action_row_3)
+
+        return InlineKeyboardMarkup(keyboard)
+
+    async def process_rclone_upload(self, client, callback_query: CallbackQuery, rclone_session_id: str):
+        rclone_session = self.rclone_sessions[rclone_session_id]
+        download_link = rclone_session['download_link']
+        destination_path = rclone_session['destination_path']
+        filename = self.get_file_name(rclone_session['download_link'])
+
+        # Initial message
+        progress_message = await callback_query.edit_message_text(
+            "🔄 **Starting rclone transfer...**\n\n"
+            f"🔗 **URL:** `{download_link}`\n"
+            f"📁 **Destination:** `{destination_path}`\n"
+            f"📄 **File:** `{filename}`\n\n"
+            "```\nInitializing...\n```"
+        )
+
+        try:
+            remote_name = self.rclone_remote
+            remote_path = f"{remote_name}:{destination_path.rstrip('/')}"
+
+            copyurl_cmd = [
+                'rclone', 'copyurl', '--config', self.rclone_config_path,
+                download_link, remote_path,
+                '--auto-filename',
+                '--buffer-size', str(self.rclone_buffer_size),
+                '--header-filename',
+                '--low-level-retries', '10',
+                '--retries', '3',
+                '-v'
+            ]
+
+            process = await asyncio.create_subprocess_exec(
+                *copyurl_cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            start_time = time.time()
+            last_update_time = start_time
+            dot_cycle = 0
+
+            while True:
+                current_time = time.time()
+
+                if current_time - last_update_time >= 6:
+                    elapsed = round(current_time - start_time, 1)
+                    dots = "." * ((dot_cycle % 3) + 1)
+                    latest_output = f"elapsed time {elapsed}s\ntransferring {dots}"
+
+                    try:
+                        await client.edit_message_text(
+                            chat_id=callback_query.message.chat.id,
+                            message_id=progress_message.id,
+                            text=(
+                                "🔄 **rclone transfer in progress**\n\n"
+                                f"🔗 **URL:** `{download_link}`\n"
+                                f"📁 **Destination:** `{destination_path}`\n"
+                                f"📄 **File:** `{filename}`\n\n"
+                                f"```\n{latest_output}\n```"
+                            )
+                        )
+                    except Exception as e:
+                        if "MESSAGE_NOT_MODIFIED" not in str(e):
+                            logger.error(f"Error updating progress: {e}")
+
+                    last_update_time = current_time
+                    dot_cycle += 1
+
+                if process.returncode is not None:
+                    break
+
+                await asyncio.sleep(0.2)
+
+            elapsed = int(time.time() - start_time)
+
+            if process.returncode == 0:
+                await client.edit_message_text(
+                    chat_id=callback_query.message.chat.id,
+                    message_id=progress_message.id,
+                    text=(
+                        "✅ **rclone transfer completed successfully**\n\n"
+                        f"🔗 **URL:** `{download_link}`\n"
+                        f"📁 **Destination:** `{destination_path}`\n"
+                        f"📄 **File:** `{filename}`\n\n"
+                        f"⏱️ **Time:** {elapsed} seconds\n"
+                    )
+                )
+            else:
+                await client.edit_message_text(
+                    chat_id=callback_query.message.chat.id,
+                    message_id=progress_message.id,
+                    text=(
+                        "❌ **rclone transfer failed**\n\n"
+                        f"🔗 **URL:** `{download_link}`\n"
+                        f"📁 **Destination:** `{destination_path}`\n"
+                        f"📄 **File:** `{filename}`\n\n"
+                        f"⏱️ **Time:** {elapsed} seconds\n"
+                        f"**Exit code:** {process.returncode}\n"
+                    )
+                )
+
+        except FileNotFoundError:
+            await client.edit_message_text(
+                chat_id=callback_query.message.chat.id,
+                message_id=progress_message.id,
+                text=(
+                    "❌ **rclone not found**\n\n"
+                    "The rclone command-line tool is not installed on this system.\n\n"
+                    "Please install rclone to use this feature:\n"
+                    "https://rclone.org/install/"
+                )
+            )
+
+        except Exception as e:
+            logger.error(f"Error in rclone process: {e}")
+            await client.edit_message_text(
+                chat_id=callback_query.message.chat.id,
+                message_id=progress_message.id,
+                text=(
+                    "❌ **Unexpected error occurred**\n\n"
+                    f"🔗 **URL:** `{download_link}`\n"
+                    f"📁 **Destination:** `{destination_path}`\n"
+                    f"📄 **File:** `{filename}`\n\n"
+                    f"```\n{str(e)}\n```"
+                )
+            )
+
+        finally:
+            # Clean up session
+            if rclone_session_id in self.rclone_sessions:
+                del self.rclone_sessions[rclone_session_id]
 
     async def start_channel_indexing(self, client, index_session_id: str):
         """Start the actual channel indexing process"""
@@ -1561,162 +2077,10 @@ class TGFSBot:
         if size_bytes == 0:
             return "0 B"
         size_names = ["B", "KB", "MB", "GB", "TB"]
-        import math
         i = int(math.floor(math.log(size_bytes, 1024)))
         p = math.pow(1024, i)
         s = round(size_bytes / p, 2)
         return f"{s} {size_names[i]}"
-
-    async def create_folder_keyboard(self, current_path: str, file_session_id: str) -> InlineKeyboardMarkup:
-        """Create inline keyboard for folder and file navigation with pagination"""
-        items = await self.get_folder_structure(current_path)
-        keyboard = []
-
-        # Get pagination info from file session
-        file_session = self.file_sessions.get(file_session_id, {})
-        current_page = file_session.get('current_page', 1)
-        items_per_page = file_session.get('items_per_page', 10)
-
-        # Separate folders and files
-        folders = [item for item in items if item['is_directory']]
-        files = [item for item in items if not item['is_directory']]
-        all_items = folders + files
-
-        # Calculate pagination
-        total_items = len(all_items)
-        total_pages = (total_items + items_per_page - 1) // items_per_page
-
-        # Add pagination numbers at top, if more than 1 page
-        if total_pages > 1:
-            page_buttons = []
-
-            if total_pages <= 10:
-                # Show all page numbers
-                for page in range(1, total_pages + 1):
-                    button_text = f"• {page} •" if page == current_page else str(page)
-                    page_buttons.append(
-                        InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
-                    )
-            else:
-                # Handle more than 10 pages
-                if current_page <= 8:
-                    # Show pages 1-8, ..., last_page
-                    for page in range(1, 9):
-                        button_text = f"• {page} •" if page == current_page else str(page)
-                        page_buttons.append(
-                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
-                        )
-                    page_buttons.append(
-                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
-                    )
-                    page_buttons.append(
-                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
-                    )
-                else:
-                    # Show 1, ..., current_page-1, current_page, current_page+1, ..., last_page
-                    page_buttons.append(
-                        InlineKeyboardButton("1", callback_data=f"page:{file_session_id}:1")
-                    )
-                    page_buttons.append(
-                        InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:1")
-                    )
-
-                    for page in range(max(2, current_page - 1), min(total_pages, current_page + 2)):
-                        button_text = f"• {page} •" if page == current_page else str(page)
-                        page_buttons.append(
-                            InlineKeyboardButton(button_text, callback_data=f"page:{file_session_id}:{page}")
-                        )
-
-                    if current_page < total_pages - 1:
-                        page_buttons.append(
-                            InlineKeyboardButton("...", callback_data=f"page:{file_session_id}:{total_pages}")
-                        )
-                    page_buttons.append(
-                        InlineKeyboardButton(str(total_pages), callback_data=f"page:{file_session_id}:{total_pages}")
-                    )
-
-            # Add page buttons in rows of 5
-            for i in range(0, len(page_buttons), 5):
-                keyboard.append(page_buttons[i:i + 5])
-
-        # Get items for current page
-        start_idx = (current_page - 1) * items_per_page
-        end_idx = start_idx + items_per_page
-        page_items = all_items[start_idx:end_idx]
-
-        # Add item buttons (1 per row) with numbering
-        item_number = 1
-        for item in page_items:
-            if item['is_directory']:
-                path_hash = self.get_path_hash(item['path'])
-                keyboard.append([
-                    InlineKeyboardButton(f"{item_number}. 📁 {item['name']}", callback_data=f"nav:{file_session_id}:{path_hash}")
-                ])
-            else:
-                file_hash = self.get_path_hash(item['path'])
-                keyboard.append([
-                    InlineKeyboardButton(
-                        f"{item_number}. 📄 {item['name']} ({self.format_file_size(item['size'])})",
-                        callback_data=f"file_delete_confirm:{file_session_id}:{file_hash}"
-                    )
-                ])
-            item_number += 1
-
-        # Add action buttons
-        action_row_1 = []
-        action_row_2 = []
-        action_row_3 = []
-
-        # Back button (if not at root)
-        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
-            parent_path = '/'.join(current_path.rstrip('/').split('/')[:-1])
-            if parent_path == '/webdav':
-                parent_path = f'/webdav/{ROOT_FOLDER_NAME}'
-
-            parent_hash = self.get_path_hash(parent_path)
-            action_row_1.append(
-                InlineKeyboardButton("⬅️ Back", callback_data=f"nav:{file_session_id}:{parent_hash}")
-            )
-
-        # Select current location (for file uploads)
-        current_hash = self.get_path_hash(current_path)
-        action_row_1.append(
-            InlineKeyboardButton("✅ Select Here", callback_data=f"select:{file_session_id}:{current_hash}")
-        )
-
-        # Create new folder
-        action_row_2.append(
-            InlineKeyboardButton("➕ New Folder", callback_data=f"newfolder:{file_session_id}:{current_hash}")
-        )
-
-        # Create folder from filename
-        action_row_2.append(
-            InlineKeyboardButton("📂 Folder from File Name",
-                                 callback_data=f"folderfromname:{file_session_id}:{current_hash}")
-        )
-
-        # Delete current folder button (if not at root)
-        if current_path != f'/webdav/{ROOT_FOLDER_NAME}':
-            action_row_3.append(
-                InlineKeyboardButton("🗑️ Delete This Folder",
-                                     callback_data=f"delete_confirm:{file_session_id}:{current_hash}")
-            )
-
-        # Delete multiple items button (if there are items to delete)
-        if all_items and current_path != f'/webdav/{ROOT_FOLDER_NAME}':
-            action_row_3.append(
-                InlineKeyboardButton("🗑️ Delete Multiple",
-                                     callback_data=f"delete_multiple:{file_session_id}:{current_hash}")
-            )
-
-        if action_row_1:
-            keyboard.append(action_row_1)
-        if action_row_2:
-            keyboard.append(action_row_2)
-        if action_row_3:
-            keyboard.append(action_row_3)
-
-        return InlineKeyboardMarkup(keyboard)
 
     @staticmethod
     async def create_delete_confirmation_keyboard(file_session_id: str, item_hash: str, is_file: bool = False) -> InlineKeyboardMarkup:
@@ -2052,6 +2416,35 @@ class TGFSBot:
         """Handle inline keyboard callbacks with file session support"""
         data = callback_query.data
         user_id = callback_query.from_user.id
+
+        if data.startswith('rclone_'):
+            parts = data.split(':', 1)
+            if len(parts) != 2:
+                await callback_query.answer("Invalid callback data", show_alert=True)
+                return
+
+            action, session_id = parts[0], parts[1]
+
+            if session_id not in self.rclone_sessions:
+                await callback_query.answer("Rclone session expired. Please use /rupload again.", show_alert=True)
+                return
+
+            rclone_session = self.rclone_sessions[session_id]
+
+            if rclone_session['user_id'] != user_id:
+                await callback_query.answer("Unauthorized", show_alert=True)
+                return
+
+            if action == "rclone_start":
+                # Start the upload process
+                await self.process_rclone_upload(client, callback_query, session_id)
+            elif action == "rclone_cancel":
+                # Cancel the upload
+                await callback_query.edit_message_text("❌ **Upload cancelled**")
+                if session_id in self.rclone_sessions:
+                    del self.rclone_sessions[session_id]
+
+            return
 
         if data.startswith('import_done:') or data.startswith('import_cancel:') or data.startswith('import_with_folders:'):
             await self.handle_import_callback(client, callback_query, data)
@@ -3198,6 +3591,20 @@ class TGFSBot:
             if user_id in self.user_sessions:
                 del self.user_sessions[user_id]
 
+    def load_rclone_config(self):
+        config_path = self.rclone_config_path
+
+        if not os.path.exists(config_path):
+            logger.error(f"Config file not found: {config_path}")
+            return []
+
+        config = configparser.ConfigParser()
+        config.read(config_path)
+
+        remote_names = config.sections()
+
+        return remote_names
+
     async def cleanup_old_sessions(self):
         """Clean up old file and import sessions periodically"""
         while True:
@@ -3206,6 +3613,7 @@ class TGFSBot:
             expired_file_sessions = []
             expired_import_sessions = []
             expired_index_sessions = []
+            expired_rclone_sessions = []
 
             # Clean up file sessions
             for file_session_id, session in list(self.file_sessions.items()):
@@ -3235,6 +3643,11 @@ class TGFSBot:
                 if should_cleanup:
                     expired_index_sessions.append(index_session_id)
 
+            # Clean up rclone sessions
+            for rclone_session_id, session in list(self.rclone_sessions.items()):
+                if current_time - session.get('created_time', 0) > 3600:  # 1 hour
+                    expired_rclone_sessions.append(rclone_session_id)
+
             for session_id in expired_file_sessions:
                 del self.file_sessions[session_id]
 
@@ -3254,11 +3667,15 @@ class TGFSBot:
 
                 del self.index_sessions[session_id]
 
-            if expired_file_sessions or expired_import_sessions or expired_index_sessions:
+            for session_id in expired_rclone_sessions:
+                del self.rclone_sessions[session_id]
+
+            if expired_file_sessions or expired_import_sessions or expired_index_sessions or expired_rclone_sessions:
                 logger.info(
                     f"Cleaned up {len(expired_file_sessions)} expired file sessions, "
-                    f"{len(expired_import_sessions)} expired import sessions, and "
-                    f"{len(expired_index_sessions)} expired index sessions"
+                    f"{len(expired_import_sessions)} expired import sessions, "
+                    f"{len(expired_index_sessions)} expired index sessions, and "
+                    f"{len(expired_rclone_sessions)} expired rclone sessions"
                 )
 
     async def initialize_helper_bots(self):
@@ -3370,6 +3787,13 @@ class TGFSBot:
                 return
             logger.info("TGFS authentication successful")
 
+            if os.path.exists(self.rclone_config_path):
+                logger.info("Checking rclone.conf file")
+                if self.rclone_remote not in self.load_rclone_config():
+                    logger.error("Unable to find provided 'RCLONE_REMOTE' remote in the rclone.conf file. Please double check. Exiting...")
+                    sys.exit(0)
+                logger.info("Rclone check completed!")
+
             # Initialize main bot client
             self.app = Client(
                 "tgfs_bot",
@@ -3396,7 +3820,8 @@ class TGFSBot:
             result = await self.app.set_bot_commands([
                 BotCommand("start", "Start the bot"),
                 BotCommand("browse", "Browse the TGFS Server, Import Multiple Files, Manage Files and Folders"),
-                BotCommand("indexchannel", "Index files from a channel")
+                BotCommand("indexchannel", "Index Files From a Channel"),
+                BotCommand("rupload", "Upload Direct Link via Rclone (Also Support Rclone Crypt Remotes)")
             ])
             if result:
                 logger.info('Bot Commands Set Successfully')
