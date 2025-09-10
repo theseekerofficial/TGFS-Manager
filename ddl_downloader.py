@@ -3,6 +3,7 @@
 import os
 import time
 import aria2p
+import aiohttp
 import logging
 import asyncio
 from pathlib import Path
@@ -125,7 +126,13 @@ class AsyncFileDownloader:
             await asyncio.to_thread(aria2.remove, [download_info], force=True, files=True, clean=True)
 
             if file_size == 0:
-                raise Exception("Could not determine file size - server may not provide content-length header")
+                async with aiohttp.ClientSession() as session:
+                    async with session.head(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                        size = resp.headers.get("Content-Length")
+                        if size is not None:
+                            file_size = int(size)
+                        else:
+                            raise Exception("Could not determine file size - server may not provide content-length header")
 
             return file_size
 

@@ -166,6 +166,16 @@ class TGFSBot:
                 await message.reply("Unauthorized", reply_to_message_id=message.id)
                 return
 
+            if message.text.strip() == '/clean':
+                self.user_sessions.clear()
+                self.file_sessions.clear()
+                self.import_sessions.clear()
+                self.index_sessions.clear()
+                self.rclone_sessions.clear()
+                logger.info("All sessions have been cleared.")
+                await message.reply("All sessions have been cleared.")
+                return
+
             for rclone_session_id, rclone_session in list(self.rclone_sessions.items()):
                 if rclone_session['user_id'] == message.from_user.id:
                     if rclone_session.get('step') == 'waiting_config' and message.document:
@@ -709,7 +719,7 @@ class TGFSBot:
             'created_time': time.time(),
             'current_page': 1,
             'items_per_page': self.items_per_page,
-            'files_to_import': [],  # Store files for batch import
+            'files_to_import': [],
             'waiting_for_files': False,
             'original_message_id': message.id,
             'scroll_history': {}
@@ -799,14 +809,18 @@ class TGFSBot:
             }
             return
 
-        # If config exists, ask for direct link
+        # If config exists, ask for direct links
         reply_msg = await message.reply(
             "🔗 **Remote File Upload**\n\n"
-            "Please send the direct download link of the file you want to upload.\n\n"
+            "Please send the direct download link(s) of the file(s) you want to upload.\n\n"
             "📝 **Supported formats:**\n"
             "• HTTP/HTTPS direct links\n"
-            "• Files that can be downloaded via wget/curl\n\n"
-            "**Send the download link now:**",
+            "• Files are downloaded at high speed via aria2/curl\n"
+            "• Multiple links separated by commas\n\n"
+            "**Examples:**\n"
+            "• `https://example.com/file1.zip`\n"
+            "• `https://example.com/file1.zip,https://example.com/file2.zip`\n\n"
+            "**Send the download link(s) now:**",
             reply_to_message_id=message.id
         )
 
@@ -816,7 +830,9 @@ class TGFSBot:
             'user_id': user_id,
             'step': 'waiting_link',
             'original_message_id': message.id,
-            'reply_message_id': reply_msg.id
+            'reply_message_id': reply_msg.id,
+            'links': [],
+            'epi_mode': False
         }
 
     async def handle_index_session_text(self, client, message: Message, index_session_id: str, index_session: dict):
@@ -1212,89 +1228,217 @@ class TGFSBot:
                 return f"download_{timestamp}"
 
     async def handle_rclone_link(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
-        """Handle direct link input for rclone upload"""
+        """Handle direct link input for rclone upload - supports multiple links"""
+        download_links = message.text.strip().split(',')
+        valid_links = []
 
-        download_link = message.text.strip()
+        # Validate each link
+        for link in download_links:
+            link = link.strip()
+            if link.startswith('http://') or link.startswith('https://'):
+                valid_links.append(link)
 
-        # Basic URL validation
-        if not (download_link.startswith('http://') or download_link.startswith('https://')):
-            await message.reply("❌ Invalid URL. Please provide a valid HTTP/HTTPS link", reply_to_message_id=message.id)
+        if not valid_links:
+            await message.reply("❌ No valid URLs found. Please provide valid HTTP/HTTPS links",
+                                reply_to_message_id=message.id)
             return
 
-        # Store the download link and move to path selection
-        rclone_session['download_link'] = download_link
-        rclone_session['step'] = 'waiting_path'
+        # Store the download links and move to remote selection
+        rclone_session['download_links'] = valid_links
+        rclone_session['step'] = 'waiting_remote'
+
+        # Get available remotes
+        available_remotes = self.load_rclone_config()
+
+        # Create inline keyboard for remote selection
+        keyboard_buttons = []
+        row = []
+
+        for i, remote in enumerate(available_remotes):
+            # Mark default remote as selected
+            is_selected = "✅" if remote == self.rclone_remote else ""
+            button_text = f"{remote} {is_selected}"
+
+            row.append(InlineKeyboardButton(button_text, callback_data=f"rclone_remote:{rclone_session_id}:{remote}"))
+
+            # Add new row every 2 buttons
+            if len(row) == 2 or i == len(available_remotes) - 1:
+                keyboard_buttons.append(row)
+                row = []
+
+        # Add confirm and episode mode buttons
+        keyboard_buttons.append(
+            [InlineKeyboardButton("[❌] Episode Mode", callback_data=f"enable_epi_mode:{rclone_session_id}:no")]
+        )
+
+        keyboard_buttons.append(
+            [InlineKeyboardButton("✅ Confirm Remote and Episode Mode", callback_data=f"rclone_confirm_remote:{rclone_session_id}")]
+        )
+
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+        # Show first few links in message
+        links_preview = "\n".join([f"• {link[:50]}..." if len(link) > 50 else f"• {link}"
+                                   for link in valid_links[:3]])
+        if len(valid_links) > 3:
+            links_preview += f"\n• ... and {len(valid_links) - 3} more"
 
         await client.edit_message_text(
             chat_id=message.chat.id,
             message_id=rclone_session['reply_message_id'],
             text=(
                 f"🔗 **Remote File Upload**\n\n"
-                f"📄 **File:** `{self.get_file_name(download_link)}`\n"
-                f"🔗 **URL:** `{download_link[:50]}...`\n\n"
-                "**Please send the destination path where the file should be saved.**\n\n"
-                f"**Default Remote name:** `{self.rclone_remote}`\n\n"
-                f"`---------------------------------\n\n`"
-                f"**If you want to use another remote in the conf file, send the remote name with the path separating by** `:`\n"
-                f"Available remotes: {', '.join(f'`{remote}`' for remote in self.load_rclone_config())}\n\n"
-                f"`---------------------------------\n\n`"
-                f"📁 **Auto-create folders:**\n"
-                f"• Use `[folder]` at the end of the path to create a folder from the filename\n"
-                f"• Use `[date:timezone]` at the end of the path to create a folder with the current date and time\n\n"
-                f"`---------------------------------\n\n`"
-                "📝 **Examples:**\n"
-                "• `movies/action/` - Save in movies/action folder in default remote\n"
-                "• `movies/action/[folder]/` - Create filename folder inside movies/action\n"
-                "• `videos/[date:Asia/Colombo]/` - Create date folder inside videos with Colombo time\n"
-                "• `videos/[date:Africa/Kigali]/[folder]/` - Create date folder with Kigali time, then filename folder inside\n"
-                "• `/` - Save in root folder in default remote\n"
-                "• `Google_Drive:movies/action/` - Save in movies/action folder in Google_Drive remote\n"
-                "• `Google_Drive:movies/[folder]/` - Create filename folder in Google_Drive movies\n"
-                "• `Google_Drive:videos/[date:Asia/Colombo]/[folder]/` - Create date with Colombo time and filename folders in Google_Drive videos\n"
-                "• `Google_Drive:/` - Save in root folder in Google_Drive remote\n\n"
-                "**Send the destination path now:**"
-            )
+                f"📄 **Files:** {len(valid_links)} file(s) detected\n"
+                f"🔗 **URLs:**\n{links_preview}\n\n"
+                f"**Please select the rclone remote to use:**\n"
+                f"✅ = Currently selected\n\n"
+                f"**Default:** `{self.rclone_remote}`"
+            ),
+            reply_markup=keyboard
         )
 
         await message.delete()
 
-    async def handle_rclone_path(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
-        """Handle destination path input for rclone upload"""
-        destination_path = message.text.strip()
-
-        rclone_config = self.load_rclone_config()
-        remote_found = False
-
-        for remote_name in rclone_config:
-            if destination_path.startswith(remote_name + ':'):
-                path = destination_path[len(remote_name) + 1:]
-                self.rclone_remote = remote_name
-                destination_path = path
-                remote_found = True
-                break
-
-        if ':' in destination_path and not remote_found:
-            await message.reply("❌ Remote name not found in the configuration file", reply_to_message_id=message.id)
+    async def handle_rclone_remote_selection(self, client, callback_query: CallbackQuery, rclone_session_id: str,
+                                             remote_name: str, epi_mode_action: bool = False, current_epi_state: bool = False):
+        """Handle remote selection for rclone upload"""
+        if rclone_session_id not in self.rclone_sessions:
+            await callback_query.answer("Session expired", show_alert=True)
             return
 
+        rclone_session = self.rclone_sessions[rclone_session_id]
+
+        # Handle episode mode toggle if this is an episode mode action
+        if epi_mode_action:
+            rclone_session['epi_mode'] = not current_epi_state
+        # Only update remote if this is a remote selection action (not episode mode toggle)
+        elif not epi_mode_action:
+            self.rclone_remote = remote_name
+            rclone_session['selected_remote'] = remote_name
+
+        # Get the current remote name (either from parameter or session)
+        current_remote = remote_name if not epi_mode_action else rclone_session.get('selected_remote',
+                                                                                    self.rclone_remote)
+
+        # Get available remotes
+        available_remotes = self.load_rclone_config()
+
+        # Recreate keyboard with updated selection
+        keyboard_buttons = []
+        row = []
+
+        for i, remote in enumerate(available_remotes):
+            is_selected = "✅" if remote == current_remote else ""
+            button_text = f"{remote} {is_selected}"
+
+            row.append(InlineKeyboardButton(button_text, callback_data=f"rclone_remote:{rclone_session_id}:{remote}"))
+
+            if len(row) == 2 or i == len(available_remotes) - 1:
+                keyboard_buttons.append(row)
+                row = []
+
+        # Get current episode mode state
+        epi_mode_status = rclone_session.get('epi_mode', False)
+
+        # Add confirm and episode mode buttons
+        keyboard_buttons.append([
+            InlineKeyboardButton(f"[{'✅' if epi_mode_status else '❌'}] Episode Mode",
+                                 callback_data=f"enable_epi_mode:{rclone_session_id}:{'yes' if epi_mode_status else 'no'}")
+        ])
+
+        keyboard_buttons.append([
+            InlineKeyboardButton("✅ Confirm Remote and Episode Mode", callback_data=f"rclone_confirm_remote:{rclone_session_id}")
+        ])
+
+        keyboard = InlineKeyboardMarkup(keyboard_buttons)
+
+        # Update the message
+        valid_links = rclone_session.get('download_links', [])
+        links_preview = "\n".join([f"• {link[:50]}..." if len(link) > 50 else f"• {link}"
+                                   for link in valid_links[:3]])
+        if len(valid_links) > 3:
+            links_preview += f"\n• ... and {len(valid_links) - 3} more"
+
+        await callback_query.edit_message_text(
+            text=(
+                f"🔗 **Remote File Upload**\n\n"
+                f"📄 **Files:** {len(valid_links)} file(s) detected\n"
+                f"{'📺 **Episode Mode:** `Enabled`\n' if epi_mode_status else ''}"
+                f"🔗 **URLs:**\n{links_preview}\n\n"
+                f"**Please select the remote to use:**\n"
+                f"✅ = Currently selected\n\n"
+                f"**Selected:** `{current_remote}`"
+            ),
+            reply_markup=keyboard
+        )
+
+        if epi_mode_action:
+            alert_message = f"Episode mode {'ENABLED ✅\n\nFiles will be automatically organized into episode folders (EP01, EP02, etc.) based on their filenames. This is recommend when you are upload multiple tv show episodes.' if epi_mode_status else 'DISABLED ❌\n\nFiles will be uploaded to the specified path without episode-based organization.'}"
+            await callback_query.answer(alert_message, show_alert=True)
+        else:
+            await callback_query.answer(f"Selected remote: {current_remote}")
+
+    async def handle_rclone_remote_confirm(self, client, callback_query: CallbackQuery, rclone_session_id: str):
+        """Handle remote confirmation and move to path selection"""
+        if rclone_session_id not in self.rclone_sessions:
+            await callback_query.answer("Session expired", show_alert=True)
+            return
+
+        rclone_session = self.rclone_sessions[rclone_session_id]
+        valid_links = rclone_session.get('download_links', [])
+        is_episode_mode = rclone_session.get('epi_mode', False)
+
+        await callback_query.edit_message_text(
+            text=(
+                f"🔗 **Remote File Upload**\n\n"
+                f"📄 **Files:** {len(valid_links)} file(s)\n"
+                f"{'📺 **Episode Mode:** `Enabled`\n' if is_episode_mode else ''}"
+                f"🌐 **Remote:** `{self.rclone_remote}`\n\n"
+                "**Please send the destination path where the files should be saved.**\n\n"
+                f"📁 **Auto-create folders:**\n"
+                f"• Use `[folder]` at the end of the path to create a folder from each filename\n"
+                f"• Use `[date:timezone]` at the end of the path to create a folder with the current date and time\n\n"
+                f"📝 **Examples:**\n"
+                f"• `movies/action/` - Save in movies/action folder\n"
+                f"• `movies/action/[folder]/` - Create filename folder inside movies/action\n"
+                f"• `videos/[date:Asia/Colombo]/` - Create date folder with Colombo time\n"
+                f"• `videos/[date:Africa/Kigali]/[folder]/` - Create date folder with Kigali time, then filename folders\n"
+                f"• `/` - Save in root folder\n\n"
+                f"**All files will be uploaded to the same path pattern.**\n"
+                f"**Send the destination path now:**"
+            )
+        )
+
+        rclone_session['step'] = 'waiting_path'
+        await callback_query.answer("Remote confirmed")
+
+    async def handle_rclone_path(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
+        """Handle destination path input for rclone upload with multiple files"""
+        destination_path = message.text.strip()
         if not destination_path == '/' and not destination_path.endswith('/'):
             destination_path += '/'
         elif destination_path == '/':
             destination_path = ''
 
+        # Store the destination path
         rclone_session['destination_path'] = destination_path
         rclone_session['step'] = 'ready_to_upload'
+        is_episode_mode = rclone_session.get('epi_mode', False)
 
-        filename = self.get_file_name(rclone_session['download_link'])
+        # Get example filename
+        valid_links = rclone_session.get('download_links', [])
+        example_filename = self.get_file_name(valid_links[0]) if valid_links else "file"
+        example_path = await self.process_destination_path(destination_path, example_filename, is_episode_mode)
 
         await client.edit_message_text(
             chat_id=message.chat.id,
             message_id=rclone_session['reply_message_id'],
             text=(
                 f"🔗 **Remote File Upload - Ready**\n\n"
-                f"📄 **File:** `{filename}`\n"
-                f"🔗 **URL:** `{rclone_session['download_link'][:50]}...`\n"
-                f"📁 **Destination:** `{await self.process_destination_path(destination_path, filename) if destination_path != '' else '/'}`\n\n"
+                f"📄 **Files:** {len(valid_links)} file(s)\n"
+                f"🌐 **Remote:** `{self.rclone_remote}`\n"
+                f"📁 **Destination:** `{example_path}`\n\n"
+                f"**Example:** `{example_filename}` → `{example_path}`\n\n"
                 "**Ready to start upload?**"
             ),
             reply_markup=InlineKeyboardMarkup([
@@ -1506,132 +1650,150 @@ class TGFSBot:
         return InlineKeyboardMarkup(keyboard)
 
     async def process_rclone_upload(self, client, callback_query: CallbackQuery, rclone_session_id: str):
+        """Process rclone upload for multiple files"""
         rclone_session = self.rclone_sessions[rclone_session_id]
-        download_link = rclone_session['download_link']
+        download_links = rclone_session['download_links']
         destination_path = rclone_session['destination_path']
-        filename = self.get_file_name(rclone_session['download_link'])
+        is_episode_mode = rclone_session.get('epi_mode', False)
 
+        # Create download directory
         save_path = Path(f"downloads/{callback_query.id}_{callback_query.from_user.id}")
         save_path.mkdir(parents=True, exist_ok=True)
-
-        file_path = f"{str(save_path)}/{filename}"
-
-        downloader = AsyncFileDownloader(update_interval=self.update_interval)
-        success = await downloader.download(download_link, file_path, callback_query, filename)
-
-        only_file, file_has_content, file_abs_path = downloader.has_files(save_path)
-        if not success or not only_file or not file_has_content:
-            await callback_query.edit_message_text("❌ **Failed to download file.**\n\n`Please try again.`")
-            shutil.rmtree(save_path)
-            return
-
-        processed_destination = await self.process_destination_path(destination_path, filename)
 
         # Initial message
         progress_message = await callback_query.edit_message_text(
             "🔄 **Starting rclone transfer...**\n\n"
-            f"🔗 **URL:** `{download_link}`\n"
-            f"📁 **Destination:** `{processed_destination}`\n"
-            f"📄 **File:** `{filename}`\n\n"
+            f"📄 **Files:** {len(download_links)} file(s)\n"
+            f"🌐 **Remote:** `{self.rclone_remote}`\n"
+            f"📁 **Destination:** `{destination_path}`\n\n"
             "```\nInitializing...\n```"
         )
 
+        success_count = 0
+        failed_files = []
+
         try:
-            remote_name = self.rclone_remote
-            remote_path = f"{remote_name}:{processed_destination.rstrip('/')}"
+            for i, download_link in enumerate(download_links):
+                filename = self.get_file_name(download_link)
 
-            copy_cmd = [
-                'rclone', 'copy', '--config', self.rclone_config_path,
-                str(file_abs_path), remote_path,
-                '--transfers', '1',
-                '--checkers', '1',
-                '--buffer-size', str(self.rclone_buffer_size),
-                '--low-level-retries', '10',
-                '--retries', '3'
-            ]
+                # Download file
+                downloader = AsyncFileDownloader(update_interval=self.update_interval)
+                file_path = f"{str(save_path)}/{filename}"
 
-            process = await asyncio.create_subprocess_exec(
-                *copy_cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+                success = await downloader.download(download_link, file_path, callback_query, filename)
 
-            start_time = time.time()
-            last_update_time = start_time
-            dot_cycle = 0
+                only_file, file_has_content, file_abs_path = downloader.has_files(save_path)
+                if not success or not only_file or not file_has_content:
+                    failed_files.append((filename, "Download failed"))
+                    continue
 
-            while True:
-                current_time = time.time()
+                # Process destination path for this file
+                processed_destination = await self.process_destination_path(destination_path, filename, is_episode_mode)
 
-                if current_time - last_update_time >= self.update_interval:
-                    elapsed = round(current_time - start_time, 1)
-                    dots = "." * ((dot_cycle % 3) + 1)
-                    latest_output = f"elapsed time {elapsed}s\nTransferring {dots}"
+                # Update progress for current file
+                await client.edit_message_text(
+                    chat_id=callback_query.message.chat.id,
+                    message_id=progress_message.id,
+                    text=(
+                        "🔄 **rclone transfer in progress**\n\n"
+                        f"📄 **Files:** {i + 1}/{len(download_links)}\n"
+                        f"🌐 **Remote:** `{self.rclone_remote}`\n"
+                        f"{'📺 **Episode Mode:** `Enabled`\n' if is_episode_mode else ''}"
+                        f"📁 **Destination:** `{processed_destination}`\n"
+                        f"📄 **Current File:** `{filename}`\n\n"
+                        "```\nTransferring...\n```"
+                    )
+                )
 
-                    try:
-                        await client.edit_message_text(
-                            chat_id=callback_query.message.chat.id,
-                            message_id=progress_message.id,
-                            text=(
-                                "🔄 **rclone transfer in progress**\n\n"
-                                f"🔗 **URL:** `{download_link}`\n"
-                                f"📁 **Destination:** `{processed_destination}`\n"
-                                f"📄 **File:** `{filename}`\n\n"
-                                f"```\n{latest_output}\n```"
+                # Upload with rclone
+                remote_name = self.rclone_remote
+                remote_path = f"{remote_name}:{processed_destination.rstrip('/')}"
+
+                copy_cmd = [
+                    'rclone', 'copy', '--config', self.rclone_config_path,
+                    str(file_abs_path), remote_path,
+                    '--transfers', '1',
+                    '--checkers', '1',
+                    '--buffer-size', str(self.rclone_buffer_size),
+                    '--low-level-retries', '10',
+                    '--retries', '3'
+                ]
+
+                process = await asyncio.create_subprocess_exec(
+                    *copy_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+
+                start_time = time.time()
+                last_update_time = start_time
+                dot_cycle = 0
+
+                while True:
+                    current_time = time.time()
+
+                    if current_time - last_update_time >= self.update_interval:
+                        elapsed = round(current_time - start_time, 1)
+                        dots = "." * ((dot_cycle % 3) + 1)
+                        latest_output = f"Elapsed Time {elapsed}s\n\nTransferring {dots}"
+
+                        try:
+                            await client.edit_message_text(
+                                chat_id=callback_query.message.chat.id,
+                                message_id=progress_message.id,
+                                text=(
+                                    "🔄 **Rclone Transfer in Progress**\n\n"
+                                    f"📄 **File(s)** `{i}`/`{len(download_links)}` **done!**\n"
+                                    f"🌐 **Remote:** `{self.rclone_remote}`\n"
+                                    f"📁 **Destination:** `{processed_destination}`\n"
+                                    f"📄 **Current File:** `{filename}`\n\n"
+                                    f"```\n{latest_output}\n```"
+                                )
                             )
-                        )
-                    except Exception as e:
-                        if "MESSAGE_NOT_MODIFIED" not in str(e):
-                            logger.error(f"Error updating progress: {e}")
+                        except Exception as e:
+                            if "MESSAGE_NOT_MODIFIED" not in str(e):
+                                logger.error(f"Error updating progress: {e}")
 
-                    last_update_time = current_time
-                    dot_cycle += 1
+                        last_update_time = current_time
+                        dot_cycle += 1
 
-                if process.returncode is not None:
-                    break
+                    if process.returncode is not None:
+                        break
 
-                await asyncio.sleep(0.2)
+                    await asyncio.sleep(0.2)
 
-            elapsed = int(time.time() - start_time)
+                elapsed = int(time.time() - start_time)
 
-            if process.returncode == 0:
-                await client.edit_message_text(
-                    chat_id=callback_query.message.chat.id,
-                    message_id=progress_message.id,
-                    text=(
-                        "✅ **rclone transfer completed successfully**\n\n"
-                        f"🔗 **URL:** `{download_link}`\n"
-                        f"📁 **Destination:** `{processed_destination}`\n"
-                        f"📄 **File:** `{filename}`\n\n"
-                        f"⏱️ **Time:** {elapsed} seconds\n"
-                    )
-                )
-            else:
-                await client.edit_message_text(
-                    chat_id=callback_query.message.chat.id,
-                    message_id=progress_message.id,
-                    text=(
-                        "❌ **rclone transfer failed**\n\n"
-                        f"🔗 **URL:** `{download_link}`\n"
-                        f"📁 **Destination:** `{processed_destination}`\n"
-                        f"📄 **File:** `{filename}`\n\n"
-                        f"⏱️ **Time:** {elapsed} seconds\n"
-                        f"**Exit code:** {process.returncode}\n"
-                    )
-                )
+                if process.returncode == 0:
+                    success_count += 1
+                    logger.info(f"Successfully uploaded {filename} in {elapsed} seconds")
+                else:
+                    failed_files.append((filename, f"Rclone error: {process.returncode}"))
+                    logger.error(f"Failed to upload {filename}, exit code: {process.returncode}")
 
-            shutil.rmtree(save_path)
+                # Clean up downloaded file after upload
+                try:
+                    os.remove(file_abs_path)
+                    logger.debug(f"Cleaned up downloaded file: {filename}")
+                except Exception as e:
+                    logger.error(f"Error cleaning up file {filename}: {e}")
 
-        except FileNotFoundError:
+            # Final result
+            result_text = f"✅ **rclone transfer completed**\n\n"
+            result_text += f"📄 **Successful:** {success_count}/{len(download_links)} files\n"
+            result_text += f"{'📺 **Episode Mode:** `Enabled`\n' if is_episode_mode else ''}"
+
+            if failed_files:
+                result_text += f"❌ **Failed:** {len(failed_files)} files\n"
+                failed_list = "\n".join([f"• {filename}: {error}" for filename, error in failed_files[:5]])
+                result_text += failed_list
+                if len(failed_files) > 5:
+                    result_text += f"\n• ... and {len(failed_files) - 5} more"
+
             await client.edit_message_text(
                 chat_id=callback_query.message.chat.id,
                 message_id=progress_message.id,
-                text=(
-                    "❌ **rclone not found**\n\n"
-                    "The rclone command-line tool is not installed on this system.\n\n"
-                    "Please install rclone to use this feature:\n"
-                    "https://rclone.org/install/"
-                )
+                text=result_text
             )
 
         except Exception as e:
@@ -1641,20 +1803,100 @@ class TGFSBot:
                 message_id=progress_message.id,
                 text=(
                     "❌ **Unexpected error occurred**\n\n"
-                    f"🔗 **URL:** `{download_link}`\n"
-                    f"📁 **Destination:** `{processed_destination}`\n"
-                    f"📄 **File:** `{filename}`\n\n"
+                    f"📄 **Files:** {len(download_links)} file(s)\n"
+                    f"🌐 **Remote:** `{self.rclone_remote}`\n\n"
                     f"```\n{str(e)}\n```"
                 )
             )
 
         finally:
+            # Clean up download directory
+            try:
+                shutil.rmtree(save_path)
+                logger.debug(f"Cleaned up download directory: {save_path}")
+            except Exception as e:
+                logger.error(f"Error cleaning up download directory: {e}")
+
             # Clean up session
             if rclone_session_id in self.rclone_sessions:
                 del self.rclone_sessions[rclone_session_id]
 
     @staticmethod
-    async def process_destination_path(destination_path: str, filename: str) -> str:
+    def extract_episode_number(filename: str) -> Optional[str]:
+        filename_upper = filename.upper()
+
+        # Pattern 1: S##E## format (most common)
+        # Matches: S01E01, S1E1, s01e01, etc.
+        pattern1 = r'S\d{1,2}E(\d{1,2})'
+        match = re.search(pattern1, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 2: ##x## format (Season x Episode)
+        # Matches: 1x01, 01x01, 1X1, etc.
+        pattern2 = r'\b\d{1,2}[Xx](\d{1,2})\b'
+        match = re.search(pattern2, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 3: Episode/Ep/E followed by number
+        # Matches: Episode 1, Ep 01, E1, etc.
+        pattern3 = r'\b(?:EPISODE|EP|E)[\s\.\-_]*(\d{1,2})\b'
+        match = re.search(pattern3, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 4: Part/Pt followed by number
+        # Matches: Part 1, Pt 01, etc.
+        pattern4 = r'\b(?:PART|PT)[\s\.\-_]*(\d{1,2})\b'
+        match = re.search(pattern4, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 5: Just E followed by number (common in scene releases)
+        # Matches: E01, E1, etc. (but not inside words)
+        pattern5 = r'(?<![A-Z])E(\d{1,2})(?![A-Z0-9])'
+        match = re.search(pattern5, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 6: Number at end of show name before quality indicators
+        # This is more complex and tries to find episode numbers before common quality/format indicators
+        quality_indicators = [
+            '1080P', '720P', '480P', '2160P', '4K',
+            'BLURAY', 'BRRIP', 'DVDRIP', 'WEBRIP', 'HDTV', 'WEB-DL',
+            'H264', 'H265', 'X264', 'X265', 'XVID', 'DIVX',
+            'AAC', 'AC3', 'DTS', 'MP3',
+            'INTERNAL', 'REPACK', 'PROPER'
+        ]
+
+        # Create pattern to match number before quality indicators
+        quality_pattern = '|'.join(quality_indicators)
+        pattern6 = rf'[\.\-_\s](\d{{1,2}})[\.\-_\s].*?(?:{quality_pattern})'
+        match = re.search(pattern6, filename_upper)
+        if match:
+            episode_num = match.group(1).zfill(2)
+            return f"EP{episode_num}"
+
+        # Pattern 7: Three digit episode numbers (for shows with many episodes)
+        # Matches: 001, 015, 103, etc.
+        pattern7 = r'\b(\d{3})\b'
+        match = re.search(pattern7, filename_upper)
+        if match:
+            episode_num = match.group(1)
+            # Check if it's likely an episode number (not year, resolution, etc.)
+            if not (episode_num.startswith('19') or episode_num.startswith('20') or
+                    episode_num in ['720', '480', '108', '216']):
+                return f"EP{episode_num}"
+
+        return None
+
+    async def process_destination_path(self, destination_path: str, filename: str, is_epi_mode: bool) -> str:
         processed_path = destination_path
 
         if '[folder]' in processed_path:
@@ -1679,6 +1921,13 @@ class TGFSBot:
                 date_folder = current_time.strftime('%b-%d-%Y-[%a]-%H.%M')
                 pattern = r'\[date:' + re.escape(timezone_str) + r'\]'
                 processed_path = re.sub(pattern, date_folder, processed_path)
+
+        if is_epi_mode:
+            epi_number = self.extract_episode_number(filename)
+            if epi_number:
+                processed_path = f"{processed_path.rstrip('/')}/{epi_number}"
+            else:
+                logger.warning(f"Unable to extract episode number from filename: {filename}")
 
         return processed_path
 
@@ -2567,6 +2816,26 @@ class TGFSBot:
         """Handle inline keyboard callbacks with file session support"""
         data = callback_query.data
         user_id = callback_query.from_user.id
+
+        if data.startswith('rclone_remote:') or data.startswith("enable_epi_mode:"):
+            parts = data.split(':', 2)
+            if data.startswith("rclone_remote:"):
+                _, session_id, remote_name = parts
+                await self.handle_rclone_remote_selection(client, callback_query, session_id, remote_name)
+            elif data.startswith("enable_epi_mode:"):
+                _, session_id, current_state = parts
+                current_bool_state = current_state == 'yes'
+                rclone_session = self.rclone_sessions.get(session_id, {})
+                current_remote = rclone_session.get('selected_remote', self.rclone_remote)
+                await self.handle_rclone_remote_selection(client, callback_query, session_id, current_remote, True,
+                                                          current_bool_state)
+            return
+        elif data.startswith('rclone_confirm_remote:'):
+            parts = data.split(':', 1)
+            if len(parts) == 2:
+                _, session_id = parts
+                await self.handle_rclone_remote_confirm(client, callback_query, session_id)
+            return
 
         if data.startswith('rclone_'):
             parts = data.split(':', 1)
@@ -3972,7 +4241,8 @@ class TGFSBot:
                 BotCommand("start", "Start the bot"),
                 BotCommand("browse", "Browse the TGFS Server, Import Multiple Files, Manage Files and Folders"),
                 BotCommand("indexchannel", "Index Files From a Channel"),
-                BotCommand("rupload", "Upload Direct Link via Rclone (Also Support Rclone Crypt Remotes)")
+                BotCommand("rupload", "Upload Direct Link via Rclone (Also Support Rclone Crypt Remotes)"),
+                BotCommand("clean", "Clean All Sessions and Start Fresh (Run This CMD if You Want to Cancel Ongoing Process)")
             ])
             if result:
                 logger.info('Bot Commands Set Successfully')
