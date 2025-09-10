@@ -5,19 +5,26 @@ import re
 import sys
 import time
 import math
+import pytz
+import shutil
+import hashlib
 import aiohttp
 import asyncio
 import logging
 import requests
+import mimetypes
 import configparser
+from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 import xml.etree.ElementTree as ET
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait
+from email.message import EmailMessage
 from typing import Dict, List, Optional
 from pyrogram import utils as pyroutils
-from urllib.parse import unquote, quote, urlparse
+from ddl_downloader import AsyncFileDownloader
+from urllib.parse import unquote, quote, urlparse, unquote_plus
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 
 logging.basicConfig(
@@ -58,6 +65,7 @@ class TGFSBot:
         self._bot_round_robin_index = 0
         self.rclone_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rclone.conf')
         self.rclone_remote = os.getenv('RCLONE_REMOTE', '')
+        self.update_interval = 6
 
         # TGFS API settings
         self.tgfs_base_url = os.getenv('TGFS_BASE_URL', 'https://tg-webdav.mlwa.xyz')
@@ -1108,20 +1116,100 @@ class TGFSBot:
         await message.delete()
 
     @staticmethod
-    def get_file_name(d_link):
-        response = requests.head(d_link, allow_redirects=True)
+    def get_file_name(url, timeout=10, user_agent=None):
+        if not user_agent:
+            user_agent = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                          'AppleWebKit/537.36 (KHTML, like Gecko) '
+                          'Chrome/120.0.0.0 Safari/537.36')
 
-        # Try to get filename from Content-Disposition header
-        if 'content-disposition' in response.headers:
-            cd = response.headers['content-disposition']
-            # Extract filename using regex
-            filename = re.findall('filename=(.+)', cd)
-            if filename:
-                return filename[0].strip('"')
+        headers = {'User-Agent': user_agent}
 
-        # Fallback: extract from URL path
-        parsed_url = urlparse(d_link)
-        return os.path.basename(parsed_url.path)
+        try:
+            response = requests.head(url, headers=headers, timeout=timeout, allow_redirects=True)
+
+            if response.status_code >= 400:
+                headers['Range'] = 'bytes=0-1023'
+                response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+                response.close()
+
+            cd_header = response.headers.get('content-disposition')
+            if cd_header:
+                try:
+                    msg = EmailMessage()
+                    msg['content-disposition'] = cd_header
+
+                    cd_parsed = msg.get('content-disposition')
+                    if cd_parsed:
+                        filename = None
+
+                        if hasattr(msg, 'get_param'):
+                            filename = msg.get_param('filename*', header='content-disposition')
+                            if not filename:
+                                filename = msg.get_param('filename', header='content-disposition')
+
+                        if filename:
+                            filename = str(filename).strip('\'"')
+                            if filename.startswith(("UTF-8''", "utf-8''")):
+                                filename = unquote_plus(filename.split("''", 1)[1])
+
+                            # Sanitize filename
+                            filename = "".join(c for c in filename if c.isalnum() or c in '._- ()[]{}')
+                            if filename and not filename.startswith('.'):
+                                return filename
+
+                except Exception as ee:
+                    logger.error(ee)
+                    pass
+
+            final_url = response.url
+            parsed_url = urlparse(final_url)
+
+            if parsed_url.path:
+                path_obj = Path(unquote_plus(parsed_url.path))
+                potential_filename = path_obj.name
+
+                if potential_filename and '.' in potential_filename and len(potential_filename) > 1:
+                    stem = path_obj.stem
+                    suffix = path_obj.suffix
+                    if stem and suffix and len(suffix) <= 10:
+                        return potential_filename
+
+            if url != final_url:
+                orig_parsed = urlparse(url)
+                if orig_parsed.path:
+                    orig_path = Path(unquote_plus(orig_parsed.path))
+                    orig_filename = orig_path.name
+                    if orig_filename and '.' in orig_filename and len(orig_filename) > 1:
+                        return orig_filename
+
+            content_type = response.headers.get('content-type', '').split(';')[0].strip()
+            extension = mimetypes.guess_extension(content_type) or ''
+
+            url_hash = hashlib.md5(final_url.encode()).hexdigest()[:8]
+            domain = urlparse(final_url).netloc.replace('www.', '').replace('.', '_')
+
+            domain = "".join(c for c in domain if c.isalnum() or c == '_')[:20]
+
+            if not domain:
+                domain = "download"
+
+            return f"{domain}_{url_hash}{extension}"
+
+        except requests.RequestException:
+            try:
+                parsed = urlparse(url)
+                domain = parsed.netloc.replace('www.', '').replace('.', '_')
+                domain = "".join(c for c in domain if c.isalnum() or c == '_')[:20]
+                if not domain:
+                    domain = "download"
+
+                url_hash = hashlib.md5(url.encode()).hexdigest()[:8]
+                return f"{domain}_{url_hash}"
+
+            except Exception as te:
+                logger.error(te)
+                timestamp = int(time.time())
+                return f"download_{timestamp}"
 
     async def handle_rclone_link(self, client, message: Message, rclone_session_id: str, rclone_session: dict):
         """Handle direct link input for rclone upload"""
@@ -1146,14 +1234,23 @@ class TGFSBot:
                 f"🔗 **URL:** `{download_link[:50]}...`\n\n"
                 "**Please send the destination path where the file should be saved.**\n\n"
                 f"**Default Remote name:** `{self.rclone_remote}`\n\n"
+                f"`---------------------------------\n\n`"
                 f"**If you want to use another remote in the conf file, send the remote name with the path separating by** `:`\n"
-                f"Available remotes: `{", ".join(self.load_rclone_config())}`\n\n"
+                f"Available remotes: {', '.join(f'`{remote}`' for remote in self.load_rclone_config())}\n\n"
+                f"`---------------------------------\n\n`"
+                f"📁 **Auto-create folders:**\n"
+                f"• Use `[folder]` at the end of the path to create a folder from the filename\n"
+                f"• Use `[date:timezone]` at the end of the path to create a folder with the current date and time\n\n"
+                f"`---------------------------------\n\n`"
                 "📝 **Examples:**\n"
                 "• `movies/action/` - Save in movies/action folder in default remote\n"
-                "• `videos/` - Save in videos folder in default remote\n"
+                "• `movies/action/[folder]/` - Create filename folder inside movies/action\n"
+                "• `videos/[date:Asia/Colombo]/` - Create date folder inside videos with Colombo time\n"
+                "• `videos/[date:Africa/Kigali]/[folder]/` - Create date folder with Kigali time, then filename folder inside\n"
                 "• `/` - Save in root folder in default remote\n"
                 "• `Google_Drive:movies/action/` - Save in movies/action folder in Google_Drive remote\n"
-                "• `Google_Drive:videos/` - Save in videos folder in Google_Drive remote\n"
+                "• `Google_Drive:movies/[folder]/` - Create filename folder in Google_Drive movies\n"
+                "• `Google_Drive:videos/[date:Asia/Colombo]/[folder]/` - Create date with Colombo time and filename folders in Google_Drive videos\n"
                 "• `Google_Drive:/` - Save in root folder in Google_Drive remote\n\n"
                 "**Send the destination path now:**"
             )
@@ -1165,14 +1262,20 @@ class TGFSBot:
         """Handle destination path input for rclone upload"""
         destination_path = message.text.strip()
 
-        if ':' in destination_path:
-            remote_name, path = destination_path.split(':', 1)
-            if remote_name not in self.load_rclone_config():
-                await message.reply("❌ Remote name not found in the configuration file", reply_to_message_id=message.id)
-                return
-            else:
+        rclone_config = self.load_rclone_config()
+        remote_found = False
+
+        for remote_name in rclone_config:
+            if destination_path.startswith(remote_name + ':'):
+                path = destination_path[len(remote_name) + 1:]
                 self.rclone_remote = remote_name
                 destination_path = path
+                remote_found = True
+                break
+
+        if ':' in destination_path and not remote_found:
+            await message.reply("❌ Remote name not found in the configuration file", reply_to_message_id=message.id)
+            return
 
         if not destination_path == '/' and not destination_path.endswith('/'):
             destination_path += '/'
@@ -1182,14 +1285,16 @@ class TGFSBot:
         rclone_session['destination_path'] = destination_path
         rclone_session['step'] = 'ready_to_upload'
 
+        filename = self.get_file_name(rclone_session['download_link'])
+
         await client.edit_message_text(
             chat_id=message.chat.id,
             message_id=rclone_session['reply_message_id'],
             text=(
                 f"🔗 **Remote File Upload - Ready**\n\n"
-                f"📄 **File:** `{self.get_file_name(rclone_session['download_link'])}`\n"
+                f"📄 **File:** `{filename}`\n"
                 f"🔗 **URL:** `{rclone_session['download_link'][:50]}...`\n"
-                f"📁 **Destination:** `{destination_path if destination_path != '' else '/'}`\n\n"
+                f"📁 **Destination:** `{await self.process_destination_path(destination_path, filename) if destination_path != '' else '/'}`\n\n"
                 "**Ready to start upload?**"
             ),
             reply_markup=InlineKeyboardMarkup([
@@ -1406,32 +1511,47 @@ class TGFSBot:
         destination_path = rclone_session['destination_path']
         filename = self.get_file_name(rclone_session['download_link'])
 
+        save_path = Path(f"downloads/{callback_query.id}_{callback_query.from_user.id}")
+        save_path.mkdir(parents=True, exist_ok=True)
+
+        file_path = f"{str(save_path)}/{filename}"
+
+        downloader = AsyncFileDownloader(update_interval=self.update_interval)
+        success = await downloader.download(download_link, file_path, callback_query, filename)
+
+        only_file, file_has_content, file_abs_path = downloader.has_files(save_path)
+        if not success or not only_file or not file_has_content:
+            await callback_query.edit_message_text("❌ **Failed to download file.**\n\n`Please try again.`")
+            shutil.rmtree(save_path)
+            return
+
+        processed_destination = await self.process_destination_path(destination_path, filename)
+
         # Initial message
         progress_message = await callback_query.edit_message_text(
             "🔄 **Starting rclone transfer...**\n\n"
             f"🔗 **URL:** `{download_link}`\n"
-            f"📁 **Destination:** `{destination_path}`\n"
+            f"📁 **Destination:** `{processed_destination}`\n"
             f"📄 **File:** `{filename}`\n\n"
             "```\nInitializing...\n```"
         )
 
         try:
             remote_name = self.rclone_remote
-            remote_path = f"{remote_name}:{destination_path.rstrip('/')}"
+            remote_path = f"{remote_name}:{processed_destination.rstrip('/')}"
 
-            copyurl_cmd = [
-                'rclone', 'copyurl', '--config', self.rclone_config_path,
-                download_link, remote_path,
-                '--auto-filename',
+            copy_cmd = [
+                'rclone', 'copy', '--config', self.rclone_config_path,
+                str(file_abs_path), remote_path,
+                '--transfers', '1',
+                '--checkers', '1',
                 '--buffer-size', str(self.rclone_buffer_size),
-                '--header-filename',
                 '--low-level-retries', '10',
-                '--retries', '3',
-                '-v'
+                '--retries', '3'
             ]
 
             process = await asyncio.create_subprocess_exec(
-                *copyurl_cmd,
+                *copy_cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL
             )
@@ -1443,10 +1563,10 @@ class TGFSBot:
             while True:
                 current_time = time.time()
 
-                if current_time - last_update_time >= 6:
+                if current_time - last_update_time >= self.update_interval:
                     elapsed = round(current_time - start_time, 1)
                     dots = "." * ((dot_cycle % 3) + 1)
-                    latest_output = f"elapsed time {elapsed}s\ntransferring {dots}"
+                    latest_output = f"elapsed time {elapsed}s\nTransferring {dots}"
 
                     try:
                         await client.edit_message_text(
@@ -1455,7 +1575,7 @@ class TGFSBot:
                             text=(
                                 "🔄 **rclone transfer in progress**\n\n"
                                 f"🔗 **URL:** `{download_link}`\n"
-                                f"📁 **Destination:** `{destination_path}`\n"
+                                f"📁 **Destination:** `{processed_destination}`\n"
                                 f"📄 **File:** `{filename}`\n\n"
                                 f"```\n{latest_output}\n```"
                             )
@@ -1481,7 +1601,7 @@ class TGFSBot:
                     text=(
                         "✅ **rclone transfer completed successfully**\n\n"
                         f"🔗 **URL:** `{download_link}`\n"
-                        f"📁 **Destination:** `{destination_path}`\n"
+                        f"📁 **Destination:** `{processed_destination}`\n"
                         f"📄 **File:** `{filename}`\n\n"
                         f"⏱️ **Time:** {elapsed} seconds\n"
                     )
@@ -1493,12 +1613,14 @@ class TGFSBot:
                     text=(
                         "❌ **rclone transfer failed**\n\n"
                         f"🔗 **URL:** `{download_link}`\n"
-                        f"📁 **Destination:** `{destination_path}`\n"
+                        f"📁 **Destination:** `{processed_destination}`\n"
                         f"📄 **File:** `{filename}`\n\n"
                         f"⏱️ **Time:** {elapsed} seconds\n"
                         f"**Exit code:** {process.returncode}\n"
                     )
                 )
+
+            shutil.rmtree(save_path)
 
         except FileNotFoundError:
             await client.edit_message_text(
@@ -1520,7 +1642,7 @@ class TGFSBot:
                 text=(
                     "❌ **Unexpected error occurred**\n\n"
                     f"🔗 **URL:** `{download_link}`\n"
-                    f"📁 **Destination:** `{destination_path}`\n"
+                    f"📁 **Destination:** `{processed_destination}`\n"
                     f"📄 **File:** `{filename}`\n\n"
                     f"```\n{str(e)}\n```"
                 )
@@ -1530,6 +1652,35 @@ class TGFSBot:
             # Clean up session
             if rclone_session_id in self.rclone_sessions:
                 del self.rclone_sessions[rclone_session_id]
+
+    @staticmethod
+    async def process_destination_path(destination_path: str, filename: str) -> str:
+        processed_path = destination_path
+
+        if '[folder]' in processed_path:
+            folder_name = os.path.splitext(filename)[0]
+            folder_name = re.sub(r'[<>:"/\\|?*]', '_', folder_name)
+            processed_path = processed_path.replace('[folder]', folder_name)
+
+        date_pattern = r'\[date:([^\]]+)\]'
+        date_matches = re.findall(date_pattern, processed_path)
+
+        for timezone_str in date_matches:
+            try:
+                # Get current datetime in specified timezone
+                tz = pytz.timezone(timezone_str)
+                current_time = datetime.now(tz)
+                date_folder = current_time.strftime('%b-%d-%Y-[%a]-%H.%M')
+                pattern = r'\[date:' + re.escape(timezone_str) + r'\]'
+                processed_path = re.sub(pattern, date_folder, processed_path)
+            except Exception as e:
+                logger.warning(f"Invalid timezone '{timezone_str}', using UTC: {e}")
+                current_time = datetime.now(pytz.UTC)
+                date_folder = current_time.strftime('%b-%d-%Y-[%a]-%H.%M')
+                pattern = r'\[date:' + re.escape(timezone_str) + r'\]'
+                processed_path = re.sub(pattern, date_folder, processed_path)
+
+        return processed_path
 
     async def start_channel_indexing(self, client, index_session_id: str):
         """Start the actual channel indexing process"""

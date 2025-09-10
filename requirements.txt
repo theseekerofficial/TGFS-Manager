@@ -4,3 +4,5 @@ python-dotenv>=1.0.0
 tgcrypto>=1.2.0
 aiofiles>=24.1.0
 requests>=2.32.5
+pytz>=2025.2
+aria2p>=0.12.1
