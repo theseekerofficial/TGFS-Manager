@@ -28,14 +28,10 @@ aria2 = aria2p.API(
 logger.info(f"Aria2 started successfully. Version: {aria2.client.get_version}")
 
 class AsyncFileDownloader:
-    def __init__(self, max_file_size: int = 2 * 1024 * 1024 * 1024, update_interval: int = 2):  # 2GB default
+    def __init__(self, update_interval: int = 2):  # 2GB default
         """
         Initialize the AsyncFileDownloader
-
-        Args:
-            max_file_size: Maximum file size in bytes (default: 2GB)
         """
-        self.max_file_size = max_file_size
         self.progress_update_interval = update_interval
         self.download_gid: Optional[str] = None
         self.start_time = time.time()
@@ -222,18 +218,6 @@ class AsyncFileDownloader:
                 file_size = await self.get_file_info(url)
             except Exception as e:
                 await message.edit_message_text(f"❌ **Error getting file info:**\n`{str(e)}`")
-                return False
-
-            # Check file size limit
-            if file_size > self.max_file_size:
-                size_limit = self.format_size(self.max_file_size)
-                actual_size = self.format_size(file_size)
-                await message.edit_message_text(
-                    f"❌ **File too large!**\n\n"
-                    f"**File size:** `{actual_size}`\n"
-                    f"**Max limit:** `{size_limit}`\n\n"
-                    f"Maximum download limit is **{size_limit}**"
-                )
                 return False
 
             # Start download

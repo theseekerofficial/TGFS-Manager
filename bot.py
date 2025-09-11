@@ -1684,6 +1684,12 @@ class TGFSBot:
 
                 only_file, file_has_content, file_abs_path = downloader.has_files(save_path)
                 if not success or not only_file or not file_has_content:
+                    if not success:
+                        logger.error("Not Succeed!")
+                    if not only_file:
+                        logger.error("There are multiple files in save folder")
+                    if not file_has_content:
+                        logger.error("File content is 0!")
                     failed_files.append((filename, "Download failed"))
                     continue
 

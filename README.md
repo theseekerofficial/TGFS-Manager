@@ -22,6 +22,14 @@ An unofficial TGFS Manager Bot for [TGFS](https://github.com/TheodoreKrypton/tgf
 <img src="https://i.imgur.com/lnvmuIs.png" alt="Index Channel - Complete" width="400">
 <img src="https://i.imgur.com/cksjS6H.png" alt="Index Channel - Final" width="400">
 
+## Features
+* Easily Import Files to TGFS
+* Browse TGFS Files and Manage
+* Index Entire Telegram Channels to TGFS with multiple bots
+* Rclone Crypt Support
+* Direct Download Link Upload to TGFS
+* And many many more!
+
 ## Deployment Instructions
 
 ### Docker Deployment (Recommended)
@@ -33,10 +41,20 @@ docker build -t tgfs-manager .
 
 #### Run the Container
 ```bash
-docker run -d \
+docker run \
   --name tgfs-manager \
   --restart unless-stopped \
   tgfs-manager
+```
+
+### Docker Compose Deployment (To Deploy TGFS Manager with wireguard VPN)
+
+> Place your wg0.conf (wireguard conf from your vpn provider) in /wg/wg_confs/ folder as wg0.conf
+
+> Now Run
+
+```bash
+docker compose up
 ```
 
 ### Direct Python Deployment

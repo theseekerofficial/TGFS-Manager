@@ -1,0 +1,36 @@
+services:
+  wireguard:
+    image: linuxserver/wireguard
+    container_name: wireguard
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./wg:/config
+      - /lib/modules:/lib/modules:ro
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+      - net.ipv4.conf.all.rp_filter=2
+    ports:
+      - "6800:6800"
+      - "51820:51820/udp"
+    restart: unless-stopped
+    healthcheck:
+      test: [ "CMD", "ping", "-c", "1", "8.8.8.8" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  tgfs-manager-bot:
+    build: .
+    container_name: tgfs-manager-bot
+    network_mode: container:wireguard
+    depends_on:
+      - wireguard
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
